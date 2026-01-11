@@ -1,0 +1,8 @@
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+google-genai
+flask
+flask-cors
+requests
+deepgram-sdk
