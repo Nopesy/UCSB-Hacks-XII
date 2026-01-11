@@ -2,12 +2,18 @@ import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { CalendarSync } from './calendar-sync';
 
-const API_BASE_URL = 'http://localhost:5001';
+const API_BASE_URL = 'http://localhost:3001';
 
 interface CalendarEvent {
-  time: string;
+  _id: string;
+  userId: string;
+  calendarId: string;
+  googleId?: string;
   title: string;
-  type: 'class' | 'assignment' | 'exam' | 'break';
+  startTs: string;
+  endTs: string;
+  type?: string;
+  description?: string;
 }
 
 interface CalendarDay {
@@ -43,9 +49,14 @@ export function CalendarView() {
   const [viewMonth, setViewMonth] = useState<number>(0); // 0 = Jan
   const [viewMode, setViewMode] = useState<'month'|'week'>('month');
 
+  // Clear event selection when switching view modes
+  useEffect(() => {
+    setSelectedSlot(null);
+  }, [viewMode]);
+
   const pad = (n: number) => String(n).padStart(2, '0');
   const [selectedDate, setSelectedDate] = useState<string | null>(`${viewYear}-${pad(viewMonth+1)}-10`);
-  const [selectedSlot, setSelectedSlot] = useState<{iso: string; hour: number} | null>(null);
+  const [selectedSlot, setSelectedSlot] = useState<{iso: string; hour: number; eventId?: string} | null>(null);
   const hours = Array.from({ length: 24 }, (_, i) => i); // 0 - 23 (12am - 11pm)
   const formatHour = (h: number) => {
     const ampm = h >= 12 ? 'PM' : 'AM';
@@ -130,8 +141,51 @@ export function CalendarView() {
     return result;
   }
 
-  const calendarDays = generateCalendarDays(viewYear, viewMonth);
 
+  // State for events
+  const [events, setEvents] = useState<CalendarEvent[]>([]);
+  const [loadingEvents, setLoadingEvents] = useState(false);
+  const [eventsError, setEventsError] = useState<string | null>(null);
+
+  // Fetch events for the current month
+  useEffect(() => {
+    async function fetchEvents() {
+      setLoadingEvents(true);
+      setEventsError(null);
+      try {
+        const start = `${viewYear}-${pad(viewMonth+1)}-01`;
+        const endDate = new Date(viewYear, viewMonth + 1, 0);
+        const end = `${endDate.getFullYear()}-${pad(endDate.getMonth()+1)}-${pad(endDate.getDate())}`;
+        const res = await fetch(`${API_BASE_URL}/api/events?user_id=default_user&start=${start}&end=${end}`);
+        const data = await res.json();
+        setEvents(data.events || []);
+      } catch (err) {
+        setEventsError('Failed to fetch events');
+      } finally {
+        setLoadingEvents(false);
+      }
+    }
+    fetchEvents();
+  }, [viewYear, viewMonth]);
+
+  // Map events to days
+  function mapEventsToDays(days: CalendarDay[], events: CalendarEvent[]): CalendarDay[] {
+    const dayMap: { [iso: string]: CalendarDay } = {};
+    days.forEach(day => { dayMap[day.iso!] = { ...day, events: [] }; });
+    events.forEach(event => {
+      const date = new Date(event.startTs);
+      const iso = `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}`;
+      if (dayMap[iso]) {
+        dayMap[iso].events.push({
+          ...event,
+          type: event.type || 'class',
+        });
+      }
+    });
+    return Object.values(dayMap);
+  }
+
+  const calendarDays = mapEventsToDays(generateCalendarDays(viewYear, viewMonth), events);
   const selectedDay = calendarDays.find(d => d.iso === selectedDate);
 
   const canPrev = !(viewYear === 2020 && viewMonth === 0);
@@ -187,7 +241,8 @@ export function CalendarView() {
   }
 
   const refDateForWeek = selectedDay ? new Date(selectedDay.year!, selectedDay.month!, selectedDay.date) : new Date(viewYear, viewMonth, 1);
-  const weekDays = generateWeekDays(refDateForWeek);
+  // Map events to week days
+  const weekDays = mapEventsToDays(generateWeekDays(refDateForWeek), events);
 
   const selectedDateObj = selectedDay ? new Date(selectedDay.year!, selectedDay.month!, selectedDay.date) : null;
 
@@ -486,14 +541,40 @@ export function CalendarView() {
                 {weekDays.map((d) => (
                   <div key={d.iso} className="flex flex-col border-l border-border/50">
                     {hours.map((h) => {
-                      const isSelected = selectedSlot && selectedSlot.iso === d.iso && selectedSlot.hour === h;
+                      const isSelected = selectedSlot && selectedSlot.iso === d.iso && selectedSlot.hour === h && !selectedSlot.eventId;
+                      // Find events for this day and hour
+                      const eventsForHour = d.events.filter(event => {
+                        const start = new Date(event.startTs);
+                        return start.getHours() === h;
+                      });
                       return (
-                        <button
+                        <div
                           key={h}
-                          onClick={() => setSelectedSlot({ iso: d.iso!, hour: h })}
                           className={`h-12 border-t border-border/50 transition-colors text-left px-2 ${isSelected ? 'bg-card ring-2 ring-primary' : 'hover:bg-muted/30'}`}
-                          aria-pressed={isSelected}
-                        />
+                        >
+                          {eventsForHour.map((event, idx) => {
+                            const eventSelected = selectedSlot && selectedSlot.iso === d.iso && selectedSlot.hour === h && selectedSlot.eventId === event._id;
+                            return (
+                              <button
+                                key={event._id || idx}
+                                onClick={() => {
+                                  if (selectedSlot && selectedSlot.iso === d.iso && selectedSlot.hour === h && selectedSlot.eventId === event._id) {
+                                    setSelectedSlot(null); // Deselect if already selected
+                                  } else {
+                                    setSelectedSlot({ iso: d.iso!, hour: h, eventId: event._id });
+                                  }
+                                }}
+                                className={`w-full truncate text-xs font-medium text-foreground bg-primary/10 rounded px-1 py-0.5 mb-0.5 text-left ${eventSelected ? 'ring-2 ring-primary bg-primary/20' : ''}`}
+                                aria-pressed={!!eventSelected}
+                              >
+                                {event.title}
+                                <span className="block text-[10px] text-muted-foreground font-normal">
+                                  {new Date(event.startTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - {new Date(event.endTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
                       );
                     })}
                   </div>
@@ -538,24 +619,53 @@ export function CalendarView() {
         </div>
 
         <div className="space-y-3">
-          {selectedDay?.events.map((event, index) => (
-            <div
-              key={index}
-              className="p-4 bg-muted/30 rounded-xl border-l-4"
-              style={{
-                borderColor:
-                  event.type === 'exam'
-                    ? 'var(--status-high-risk)'
-                    : event.type === 'assignment'
-                    ? 'var(--status-building)'
-                    : 'var(--accent)',
-              }}
-            >
-              <p className="text-xs text-muted-foreground mb-1">{event.time}</p>
-              <p className="text-sm font-medium text-foreground">{event.title}</p>
-              <p className="text-xs text-muted-foreground mt-1 capitalize">{event.type}</p>
-            </div>
-          ))}
+          {/* Show selected event details if an event is selected in week view */}
+          {selectedSlot && selectedSlot.eventId
+            ? (() => {
+                const event = weekDays
+                  .flatMap(day => day.events)
+                  .find(e => e._id === selectedSlot.eventId);
+                if (!event) return null;
+                return (
+                  <div
+                    className="p-4 bg-muted/30 rounded-xl border-l-4"
+                    style={{
+                      borderColor:
+                        event.type === 'exam'
+                          ? 'var(--status-high-risk)'
+                          : event.type === 'assignment'
+                          ? 'var(--status-building)'
+                          : 'var(--accent)',
+                    }}
+                  >
+                    <p className="text-xs text-muted-foreground mb-1">
+                      {new Date(event.startTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - {new Date(event.endTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </p>
+                    <p className="text-sm font-medium text-foreground">{event.title}</p>
+                    <p className="text-xs text-muted-foreground mt-1 capitalize">{event.type}</p>
+                  </div>
+                );
+              })()
+            : selectedDay?.events.map((event, index) => (
+                <div
+                  key={index}
+                  className="p-4 bg-muted/30 rounded-xl border-l-4"
+                  style={{
+                    borderColor:
+                      event.type === 'exam'
+                        ? 'var(--status-high-risk)'
+                        : event.type === 'assignment'
+                        ? 'var(--status-building)'
+                        : 'var(--accent)',
+                  }}
+                >
+                  <p className="text-xs text-muted-foreground mb-1">
+                    {new Date(event.startTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - {new Date(event.endTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </p>
+                  <p className="text-sm font-medium text-foreground">{event.title}</p>
+                  <p className="text-xs text-muted-foreground mt-1 capitalize">{event.type}</p>
+                </div>
+              ))}
         </div>
 
         <div className="mt-6 pt-6 border-t border-border/50">
