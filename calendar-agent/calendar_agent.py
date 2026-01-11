@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from google import genai
 from google.genai import types
 from calendar_tools import get_calendar_tool_instance
+import requests
 
 
 # Initialize calendar lazily (only when needed)
@@ -126,6 +127,26 @@ def find_free_time_tool(date_str: str, duration_minutes: int = 30) -> str:
     return result
 
 
+def fetch_events_from_node_api(user_id: str, start_date: str, end_date: str, node_url: str = None):
+    """Fetch events for a user and date range from the Node API."""
+    if node_url is None:
+        node_url = os.environ.get('NODE_API_URL', 'http://localhost:3001')
+    try:
+        params = {
+            'user_id': user_id,
+            'start': start_date,
+            'end': end_date,
+            'limit': 1000
+        }
+        resp = requests.get(f"{node_url}/api/events", params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get('events', [])
+    except Exception as e:
+        print(f"Error fetching events from Node API: {e}", flush=True)
+        return []
+
+
 def calculate_nap_time_tool(date_str: str, user_id: str = 'default_user', 
                             sleep_time: str = '00:00', wake_time: str = '08:00') -> str:
     """Calculate optimal nap times and windows for a given day using Gemini AI
@@ -150,103 +171,47 @@ def calculate_nap_time_tool(date_str: str, user_id: str = 'default_user',
         if days_diff > 7:
             return json.dumps({"error": f"Date is more than 7 days away. Please provide a date within the next week."})
         
-        # Get events from user_calendars.json instead of calendar tool
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        user_calendars_path = os.path.join(script_dir, 'user_data', f'{user_id}_calendars.json')
-        
+        # Fetch events from Node API for the target date
+        start_date = date_str
+        end_date = date_str
+        all_events = fetch_events_from_node_api(user_id, start_date, end_date)
         day_events = []
-        if os.path.exists(user_calendars_path):
-            try:
-                with open(user_calendars_path, 'r') as f:
-                    calendar_data = json.load(f)
-                    all_events = calendar_data.get('events', [])
-                    
-                    # Filter events for the target date
-                    for event in all_events:
-                        start_data = event.get('start', {})
-                        if isinstance(start_data, dict):
-                            event_start_str = start_data.get('dateTime') or start_data.get('date')
+        for event in all_events:
+            # Try to parse start time from normalized or raw fields
+            startISO = event.get('startISO')
+            if not startISO and 'raw' in event:
+                raw = event['raw']
+                startISO = raw.get('start', {}).get('dateTime') or raw.get('start', {}).get('date')
+            if startISO:
+                try:
+                    dt_str = startISO
+                    if dt_str.endswith('Z'):
+                        dt_str = dt_str[:-1] + '+00:00'
+                    event_dt = datetime.fromisoformat(dt_str)
+                    if event_dt.tzinfo:
+                        event_dt = event_dt.astimezone().replace(tzinfo=None)
+                    if event_dt.date() == target_date:
+                        # Parse end time
+                        endISO = event.get('endISO')
+                        if not endISO and 'raw' in event:
+                            raw = event['raw']
+                            endISO = raw.get('end', {}).get('dateTime') or raw.get('end', {}).get('date')
+                        if endISO:
+                            if endISO.endswith('Z'):
+                                endISO = endISO[:-1] + '+00:00'
+                            event_end = datetime.fromisoformat(endISO)
+                            if event_end.tzinfo:
+                                event_end = event_end.astimezone().replace(tzinfo=None)
                         else:
-                            event_start_str = str(start_data)
-                        
-                        if event_start_str:
-                            try:
-                                # Handle timezone formats
-                                dt_str = event_start_str
-                                if dt_str.endswith('Z'):
-                                    dt_str = dt_str[:-1] + '+00:00'
-                                event_dt = datetime.fromisoformat(dt_str)
-                                if event_dt.tzinfo:
-                                    event_dt = event_dt.astimezone().replace(tzinfo=None)
-                                
-                                # Check if event is on target date
-                                if event_dt.date() == target_date:
-                                    end_data = event.get('end', {})
-                                    if isinstance(end_data, dict):
-                                        event_end_str = end_data.get('dateTime') or end_data.get('date')
-                                    else:
-                                        event_end_str = str(end_data) if end_data else None
-                                    
-                                    if event_end_str:
-                                        if event_end_str.endswith('Z'):
-                                            event_end_str = event_end_str[:-1] + '+00:00'
-                                        event_end = datetime.fromisoformat(event_end_str)
-                                        if event_end.tzinfo:
-                                            event_end = event_end.astimezone().replace(tzinfo=None)
-                                    else:
-                                        event_end = event_dt + timedelta(hours=1)
-                                    
-                                    day_events.append({
-                                        'title': event.get('summary', 'Event'),
-                                        'start': event_dt,
-                                        'end': event_end,
-                                        'description': event.get('description', '')
-                                    })
-                            except (ValueError, AttributeError):
-                                continue
-            except Exception as e:
-                print(f"Warning: Could not load calendar data: {e}", flush=True)
-        
-        # If calendar tool is available, also try to get events from it
-        try:
-            cal = get_calendar()
-            if cal:
-                tool_events = cal.get_events(days_ahead=max(days_diff + 1, 1))
-                for event in tool_events:
-                    event_start = event.get('start', '')
-                    if isinstance(event_start, str):
-                        try:
-                            dt_str = event_start
-                            if dt_str.endswith('Z'):
-                                dt_str = dt_str[:-1] + '+00:00'
-                            event_dt = datetime.fromisoformat(dt_str)
-                            if event_dt.tzinfo:
-                                event_dt = event_dt.astimezone().replace(tzinfo=None)
-                            
-                            if event_dt.date() == target_date:
-                                # Check if we already have this event
-                                if not any(e['start'] == event_dt and e['title'] == event.get('title') for e in day_events):
-                                    event_end_str = event.get('end', '')
-                                    if isinstance(event_end_str, str):
-                                        if event_end_str.endswith('Z'):
-                                            event_end_str = event_end_str[:-1] + '+00:00'
-                                        event_end = datetime.fromisoformat(event_end_str)
-                                        if event_end.tzinfo:
-                                            event_end = event_end.astimezone().replace(tzinfo=None)
-                                    else:
-                                        event_end = event_dt + timedelta(hours=1)
-                                    
-                                    day_events.append({
-                                        'title': event.get('title', 'Event'),
-                                        'start': event_dt,
-                                        'end': event_end,
-                                        'description': event.get('description', '')
-                                    })
-                        except (ValueError, AttributeError):
-                            continue
-        except Exception:
-            # Calendar tool not available, that's okay - we have user_calendars.json
-            pass
+                            event_end = event_dt + timedelta(hours=1)
+                        day_events.append({
+                            'title': event.get('title', event.get('summary', 'Event')),
+                            'start': event_dt,
+                            'end': event_end,
+                            'description': event.get('description', '')
+                        })
+                except Exception as e:
+                    continue
         
         # Sort events by start time
         day_events.sort(key=lambda x: x['start'])
@@ -691,20 +656,6 @@ def calculate_meal_windows_tool(date_str: str, user_id: str = 'default_user',
         else:
             schedule_text = f"\n\n📅 SCHEDULE FOR {target_date.strftime('%A, %B %d, %Y')}:\nNo events scheduled for this day.\n"
         
-        # Parse sleep and wake times
-        try:
-            sleep_hour, sleep_minute = map(int, sleep_time.split(':'))
-            wake_hour, wake_minute = map(int, wake_time.split(':'))
-            sleep_time_obj = datetime.min.time().replace(hour=sleep_hour, minute=sleep_minute)
-            wake_time_obj = datetime.min.time().replace(hour=wake_hour, minute=wake_minute)
-        except (ValueError, AttributeError):
-            # Default to midnight and 8 AM if parsing fails
-            sleep_time_obj = datetime.min.time().replace(hour=0, minute=0)
-            wake_time_obj = datetime.min.time().replace(hour=8, minute=0)
-        
-        sleep_time_str = sleep_time_obj.strftime('%I:%M %p')
-        wake_time_str = wake_time_obj.strftime('%I:%M %p')
-        
         # Calculate meal timing windows based on wake/sleep times
         wake_dt = datetime.combine(target_date, wake_time_obj)
         sleep_dt = datetime.combine(target_date, sleep_time_obj)
@@ -1135,7 +1086,7 @@ Be specific and evidence-based in your analysis. Consider schedule density, slee
         api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY')
         
         if not api_key:
-            return json.dumps({"error": "GOOGLE_API_KEY or GEMINI_API_KEY not found. Cannot predict burnout."})
+            return json.dumps({"error": "GOOGLE_API_KEY or GEMINI_API_KEY not found"})
         
         # Set GOOGLE_API_KEY for genai.Client() to pick up automatically
         if not os.getenv('GOOGLE_API_KEY'):
@@ -1641,6 +1592,56 @@ def load_calendar_context(user_id: str = 'default_user', days_back: int = 10) ->
         now = datetime.now()
         cutoff_date = now - timedelta(days=days_back)
         
+        # Filter and format events
+        filtered_events = []
+        for event in events:
+            # Parse event start time
+            start_data = event.get('start', {})
+            event_start = None
+            
+            if 'dateTime' in start_data:
+                dt_str = start_data['dateTime']
+                # Handle 'Z' timezone indicator (UTC)
+                if dt_str.endswith('Z'):
+                    dt_str = dt_str[:-1] + '+00:00'
+                try:
+                    event_start = datetime.fromisoformat(dt_str)
+                    # Convert to local time if timezone info present
+                    if event_start.tzinfo:
+                        event_start = event_start.astimezone().replace(tzinfo=None)
+                except (ValueError, AttributeError):
+                    # Fallback: try parsing without timezone
+                    try:
+                        # Remove timezone offset (everything after + or - at the end)
+                        if '+' in dt_str:
+                            dt_str = dt_str.split('+')[0]
+                        elif dt_str.count('-') > 2:  # Has timezone offset
+                            # Find the last '-' that's part of timezone (before timezone)
+                            parts = dt_str.rsplit('-', 1)
+                            if len(parts) == 2 and ':' in parts[1]:
+                                dt_str = parts[0]
+                        event_start = datetime.fromisoformat(dt_str)
+                    except ValueError:
+                        continue
+            elif 'date' in start_data:
+                try:
+                    event_start = datetime.fromisoformat(start_data['date'])
+                except ValueError:
+                    continue
+            else:
+                continue
+            
+            # Only include events within the date range
+            if event_start and event_start >= cutoff_date:
+                summary = event.get('summary', 'No title')
+                end_data = event.get('end', {})
+                end_str = 'Unknown'
+                
+                if 'dateTime' in end_data:
+                    dt_str = end_data['dateTime']
+                    if dt_str.endswith('Z'):
+                        dt_str = dt_str.replace('Z', '+00:00')
+                    # ...continue with parsing dt_str as a datetime...
         # Filter and format events
         filtered_events = []
         for event in events:
