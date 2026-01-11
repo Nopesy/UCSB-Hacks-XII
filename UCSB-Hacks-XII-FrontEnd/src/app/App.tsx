@@ -3,12 +3,72 @@ import { BurnoutMetrics } from './components/burnout-metrics';
 import { VoiceCheckIn } from './components/voice-checkin';
 import { ActivitySummary } from './components/activity-summary';
 import { CalendarView } from './components/calendar-view';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Login } from './components/Login';
+import { SleepCheckInModal } from './components/SleepCheckInModal';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'calendar'>('dashboard');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+
+  const [sleep, setSleep] = useState<{ sleepTime: string; wakeTime: string } | null>(null);
+  const [showSleepModal, setShowSleepModal] = useState(false);
+  const [sleepError, setSleepError] = useState<string | null>(null);
+
+  const formatTime = (t: string) => {
+    try {
+      const [hh, mm] = t.split(':');
+      const date = new Date();
+      date.setHours(Number(hh), Number(mm), 0, 0);
+      return date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+    } catch {
+      return t;
+    }
+  };
+
+  useEffect(() => {
+    let mounted = true;
+    async function load() {
+      try {
+        const res = await fetch('/api/sleep/today');
+        if (!mounted) return;
+        console.log('[App] GET /api/sleep/today status:', res.status, res.statusText);
+        const resText = await res.text().catch(() => '');
+        let resBody: any = resText;
+        try {
+          resBody = resText ? JSON.parse(resText) : resBody;
+        } catch (e) {
+          // non-JSON response
+        }
+        console.log('[App] GET /api/sleep/today body:', resBody);
+
+        if (res.status === 200) {
+          const data = (typeof resBody === 'object' ? resBody : null);
+          setSleep(data);
+          setShowSleepModal(false);
+        } else if (res.status === 404) {
+          setShowSleepModal(true);
+        } else {
+          setShowSleepModal(true);
+        }
+      } catch (err) {
+        if (!mounted) return;
+        console.error('[App] GET /api/sleep/today fetch error:', err);
+        setShowSleepModal(true);
+      }
+    }
+
+    load();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const handleSleepSaved = (data: { sleepTime: string; wakeTime: string }) => {
+    setSleep(data);
+    setShowSleepModal(false);
+    setSleepError(null);
+  };
 
   const weekData = [
     { day: 'Mon', date: '1/6', score: 28, status: 'stable', cortisol: [20, 25, 30, 35, 25, 20] },
@@ -71,6 +131,16 @@ export default function App() {
           <div>
             <h1 className="text-3xl tracking-tight text-foreground">Burnout Radar</h1>
             <p className="text-muted-foreground mt-1">Your week at a glance</p>
+
+            <div className="mt-3 flex items-center gap-3">
+              <div className="bg-muted rounded-lg px-3 py-1 text-sm text-muted-foreground">{sleep ? `Last sleep: ${formatTime(sleep.sleepTime)} — ${formatTime(sleep.wakeTime)}` : 'No sleep logged'}</div>
+              <button
+                onClick={() => setShowSleepModal(true)}
+                className="text-sm text-muted-foreground hover:text-foreground"
+              >
+                Check sleep
+              </button>
+            </div>
           </div>
 
           <div className="ml-auto flex items-center gap-2">
@@ -188,7 +258,12 @@ export default function App() {
 
         {/* Calendar View */}
         {activeTab === 'calendar' && <CalendarView />}
-      </div>
+        <SleepCheckInModal
+          isOpen={showSleepModal}
+          onClose={() => setShowSleepModal(false)}
+          onSaved={(d) => handleSleepSaved(d)}
+          initial={sleep ?? undefined}
+        />      </div>
     </div>
   );
 }
