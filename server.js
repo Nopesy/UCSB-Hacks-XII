@@ -5,6 +5,7 @@ import mongoose from "mongoose"
 
 import SleepEntry from "./models/SleepEntry.js"
 import CalendarEvent from "./models/CalendarEvent.js"
+import EventRating from "./models/EventRating.js"
 
 
 dotenv.config() //loads .env file contents into process.env
@@ -185,6 +186,85 @@ app.get('/api/calendars', async (req, res) => {
     res.json({ calendars: agg })
   } catch (err) {
     console.error('GET /api/calendars error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /api/events/unrated - get past events from last 3 days that haven't been rated
+app.get('/api/events/unrated', async (req, res) => {
+  try {
+    const userId = req.query.user_id || DEMO_USER_ID
+    const threeDaysAgo = new Date()
+    threeDaysAgo.setDate(threeDaysAgo.getDate() - 3)
+    const now = new Date()
+
+    // Find events from last 3 days that have ended
+    const pastEvents = await CalendarEvent.find({
+      userId,
+      endTs: { $gte: threeDaysAgo, $lte: now }
+    }).sort({ endTs: -1 }).limit(20).lean()
+
+    // Get all rated event IDs for this user
+    const ratings = await EventRating.find({ userId }).select('eventId').lean()
+    const ratedEventIds = new Set(ratings.map(r => r.eventId))
+
+    // Filter out events that are already rated
+    const unratedEvents = pastEvents.filter(e => !ratedEventIds.has(e.googleId))
+
+    res.json({ events: unratedEvents })
+  } catch (err) {
+    console.error('GET /api/events/unrated error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /api/ratings - create or update an event rating
+app.post('/api/ratings', async (req, res) => {
+  try {
+    const { user_id, event_id, calendar_id, event_title, event_start_time, happiness_rating, tiredness_rating, journal_entry } = req.body
+    const userId = user_id || DEMO_USER_ID
+
+    if (!event_id || happiness_rating == null || tiredness_rating == null) {
+      return res.status(400).json({ error: 'event_id, happiness_rating, and tiredness_rating are required' })
+    }
+
+    const rating = await EventRating.findOneAndUpdate(
+      { userId, eventId: event_id },
+      {
+        $set: {
+          userId,
+          eventId: event_id,
+          calendarId: calendar_id || '',
+          eventTitle: event_title || '',
+          eventStartTime: event_start_time ? new Date(event_start_time) : null,
+          happinessRating: happiness_rating,
+          tirednessRating: tiredness_rating,
+          journalEntry: journal_entry || '',
+        }
+      },
+      { upsert: true, new: true }
+    ).lean()
+
+    res.json({ success: true, rating })
+  } catch (err) {
+    console.error('POST /api/ratings error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /api/ratings - get ratings for a user
+app.get('/api/ratings', async (req, res) => {
+  try {
+    const userId = req.query.user_id || DEMO_USER_ID
+    const eventId = req.query.event_id
+
+    const query = { userId }
+    if (eventId) query.eventId = eventId
+
+    const ratings = await EventRating.find(query).sort({ createdAt: -1 }).lean()
+    res.json({ ratings })
+  } catch (err) {
+    console.error('GET /api/ratings error:', err)
     res.status(500).json({ error: err.message })
   }
 })

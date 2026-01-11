@@ -13,6 +13,13 @@ from googleapiclient.discovery import build
 from google import genai
 from calendar_agent import calculate_nap_time_tool, calculate_meal_windows_tool, predict_burnout_tool, predict_burnout_batch_tool, load_burnout_cache
 import secrets
+from dotenv import load_dotenv
+
+# Load environment variables from project root .env file
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+ENV_PATH = os.path.join(PROJECT_ROOT, '.env')
+load_dotenv(ENV_PATH)
 
 # Allow HTTP for local development (disable HTTPS requirement)
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
@@ -23,11 +30,12 @@ CORS(app, supports_credentials=True)
 
 # OAuth configuration
 SCOPES = ['https://www.googleapis.com/auth/calendar']
-CLIENT_SECRETS_FILE = "credentials.json"
+# SCRIPT_DIR already defined above when loading .env
+CLIENT_SECRETS_FILE = os.path.join(SCRIPT_DIR, "credentials.json")
 REDIRECT_URI = "http://localhost:5001/oauth/callback"
 
 # Storage paths
-USERS_DIR = "user_data"
+USERS_DIR = os.path.join(SCRIPT_DIR, "user_data")
 os.makedirs(USERS_DIR, exist_ok=True)
 
 # In-memory store for OAuth states (since session doesn't work with popups)
