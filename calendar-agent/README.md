@@ -85,6 +85,9 @@ API runs on `http://localhost:5001`
 
 The agent uses Pacific Time (America/Los_Angeles) by default. All times are interpreted in this timezone.
 
+- `NODE_API_URL` (optional): URL of the Node API to POST synced events to (default `http://localhost:3001`).
+- `CAL_AGENT_CHUNK_SIZE` (optional): number of events per POST when syncing large calendars (default `500`).
+
 ## Security Notes
 
 - Never commit `credentials.json`, `token.json`, or any files in `user_data/`

@@ -16,4 +16,10 @@ export default defineConfig({
       '@': path.resolve(__dirname, './src'),
     },
   },
+  server: {
+    // During development forward /api requests to the local backend
+    proxy: {
+      '/api': 'http://localhost:3001',
+    },
+  },
 })

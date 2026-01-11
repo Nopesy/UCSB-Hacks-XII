@@ -258,15 +258,94 @@ def sync_calendars():
                 'synced_at': datetime.now().isoformat()
             }, f, indent=2)
 
+        # Attempt to POST the fetched events to the Node API for persistence
+        node_post_info = None
+        try:
+            import requests, time, math
+            node_url = os.environ.get('NODE_API_URL', 'http://localhost:3001')
+
+            # If very large number of events, POST in chunks to avoid payload-too-large errors
+            CHUNK_SIZE = int(os.environ.get('CAL_AGENT_CHUNK_SIZE', 500))
+            total_events = len(all_events)
+            if total_events == 0:
+                node_post_info = {"ok": True, "status": 204, "text": "no events to post", "batches": []}
+            else:
+                batches = []
+                for i in range(0, total_events, CHUNK_SIZE):
+                    chunk = all_events[i:i+CHUNK_SIZE]
+                    payload = {"user_id": user_id, "events": chunk}
+
+                    # Retry per chunk
+                    chunk_result = None
+                    for attempt in range(3):
+                        try:
+                            r = requests.post(f"{node_url}/api/events/sync", json=payload, timeout=30)
+                            chunk_result = {"ok": r.ok, "status": r.status_code, "text": r.text}
+                            if r.ok:
+                                print(f"DEBUG: Posted chunk {i//CHUNK_SIZE + 1} ({len(chunk)} events) to Node API: {r.status_code}")
+                                break
+                            else:
+                                print(f"DEBUG: Node API error on chunk {i//CHUNK_SIZE + 1}: {r.status_code} {r.text}")
+                                time.sleep(1)
+                        except Exception as e:
+                            chunk_result = {"ok": False, "error": str(e)}
+                            print(f"DEBUG: Error posting chunk {i//CHUNK_SIZE + 1} to Node API: {e}")
+                            time.sleep(1)
+
+                    batches.append({
+                        "batch_index": i//CHUNK_SIZE + 1,
+                        "size": len(chunk),
+                        "result": chunk_result
+                    })
+
+                node_post_info = {
+                    "ok": all(b.get('result', {}).get('ok') for b in batches),
+                    "status": None,
+                    "text": None,
+                    "total_events": total_events,
+                    "total_batches": len(batches),
+                    "batches": batches
+                }
+        except Exception as e:
+            node_post_info = {"ok": False, "error": str(e)}
+            print(f"DEBUG: Skipping Node API post (requests not available or other error): {e}")
+
         return jsonify({
             "success": True,
-            "message": f"Synced {len(selected_calendar_ids)} calendars with {len(all_events)} events"
+            "message": f"Synced {len(selected_calendar_ids)} calendars with {len(all_events)} events",
+            "node_post": node_post_info,
         })
 
     except Exception as e:
         import traceback
         print(f"DEBUG: Exception in sync_calendars: {str(e)}", flush=True)
         print(f"DEBUG: Traceback: {traceback.format_exc()}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/calendars/synced', methods=['POST'])
+def get_synced_calendars():
+    """
+    Return the stored selected calendars and metadata for a user
+    """
+    try:
+        data = request.json
+        user_id = data.get('user_id', 'default_user')
+
+        user_calendars_path = os.path.join(USERS_DIR, f"{user_id}_calendars.json")
+        if not os.path.exists(user_calendars_path):
+            return jsonify({"selected_calendars": [], "event_count": 0, "synced_at": None})
+
+        with open(user_calendars_path, 'r') as f:
+            calendar_data = json.load(f)
+
+        return jsonify({
+            "selected_calendars": calendar_data.get('selected_calendars', []),
+            "event_count": calendar_data.get('event_count', 0),
+            "synced_at": calendar_data.get('synced_at')
+        })
+
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
