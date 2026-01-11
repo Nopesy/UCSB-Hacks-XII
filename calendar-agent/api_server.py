@@ -15,6 +15,8 @@ from calendar_agent import calculate_nap_time_tool, calculate_meal_windows_tool,
 import secrets
 from dotenv import load_dotenv
 
+load_dotenv()
+
 # Load environment variables from project root .env file
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)

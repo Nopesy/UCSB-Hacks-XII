@@ -1,3 +1,23 @@
+// GET /api/sleep/:date?user_id=... - fetch sleep entry for a specific date and user
+app.get("/api/sleep/:date", async (req, res) => {
+  const { date } = req.params;
+  const userId = req.query.user_id || DEMO_USER_ID;
+  if (!date) {
+    return res.status(400).json({ message: "date param required (YYYY-MM-DD)" });
+  }
+  const entry = await SleepEntry.findOne({
+    userId,
+    dateKey: date,
+  }).lean();
+  if (!entry) {
+    return res.status(404).json({ message: "No sleep entry for this date" });
+  }
+  res.json({
+    sleepTime: entry.sleepTime,
+    wakeTime: entry.wakeTime,
+    dateKey: entry.dateKey,
+  });
+});
 import express from "express"
 import cors from "cors"
 import dotenv from "dotenv"

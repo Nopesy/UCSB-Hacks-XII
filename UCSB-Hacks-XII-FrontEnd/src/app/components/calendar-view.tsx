@@ -2,7 +2,8 @@ import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { CalendarSync } from './calendar-sync';
 
-const API_BASE_URL = 'http://localhost:3001';
+const EVENTS_API_BASE_URL = 'http://localhost:3001';
+const HEALTH_API_BASE_URL = 'http://localhost:5001';
 
 interface CalendarEvent {
   _id: string;
@@ -156,7 +157,7 @@ export function CalendarView() {
         const start = `${viewYear}-${pad(viewMonth+1)}-01`;
         const endDate = new Date(viewYear, viewMonth + 1, 0);
         const end = `${endDate.getFullYear()}-${pad(endDate.getMonth()+1)}-${pad(endDate.getDate())}`;
-        const res = await fetch(`${API_BASE_URL}/api/events?user_id=default_user&start=${start}&end=${end}`);
+        const res = await fetch(`${EVENTS_API_BASE_URL}/api/events?user_id=default_user&start=${start}&end=${end}`);
         const data = await res.json();
         setEvents(data.events || []);
       } catch (err) {
@@ -266,7 +267,7 @@ export function CalendarView() {
     setBurnoutStatus(null);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/burnout/predict`, {
+      const response = await fetch(`${HEALTH_API_BASE_URL}/api/burnout/predict`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -304,8 +305,29 @@ export function CalendarView() {
     setNapError(null);
     setNapEvents([]);
 
+    // Filter events for the selected date
+    const dayEvents = events.filter(e => {
+      const eventDate = new Date(e.startTs);
+      const iso = `${eventDate.getFullYear()}-${pad(eventDate.getMonth()+1)}-${pad(eventDate.getDate())}`;
+      return iso === selectedDate;
+    });
+
+    // Fetch sleep entry for the selected date
+    let sleepTime = '00:00';
+    let wakeTime = '08:00';
     try {
-      const response = await fetch(`${API_BASE_URL}/api/nap-times/calculate`, {
+      const sleepRes = await fetch(`${EVENTS_API_BASE_URL}/api/sleep/${selectedDate}?user_id=default_user`);
+      if (sleepRes.ok) {
+        const sleepData = await sleepRes.json();
+        sleepTime = sleepData.sleepTime || sleepTime;
+        wakeTime = sleepData.wakeTime || wakeTime;
+      }
+    } catch (e) {
+      // fallback to defaults
+    }
+
+    try {
+      const response = await fetch(`${HEALTH_API_BASE_URL}/api/nap-times/calculate`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -313,7 +335,9 @@ export function CalendarView() {
         body: JSON.stringify({
           date: selectedDate,
           user_id: 'default_user',
-          // Using default sleep_time: '00:00' and wake_time: '08:00'
+          events: dayEvents,
+          sleep_time: sleepTime,
+          wake_time: wakeTime,
         }),
       });
 
@@ -345,8 +369,29 @@ export function CalendarView() {
     setMealError(null);
     setMealEvents([]);
 
+    // Filter events for the selected date
+    const dayEvents = events.filter(e => {
+      const eventDate = new Date(e.startTs);
+      const iso = `${eventDate.getFullYear()}-${pad(eventDate.getMonth()+1)}-${pad(eventDate.getDate())}`;
+      return iso === selectedDate;
+    });
+
+    // Fetch sleep entry for the selected date
+    let sleepTime = '00:00';
+    let wakeTime = '08:00';
     try {
-      const response = await fetch(`${API_BASE_URL}/api/meal-windows/calculate`, {
+      const sleepRes = await fetch(`${EVENTS_API_BASE_URL}/api/sleep/${selectedDate}?user_id=default_user`);
+      if (sleepRes.ok) {
+        const sleepData = await sleepRes.json();
+        sleepTime = sleepData.sleepTime || sleepTime;
+        wakeTime = sleepData.wakeTime || wakeTime;
+      }
+    } catch (e) {
+      // fallback to defaults
+    }
+
+    try {
+      const response = await fetch(`${HEALTH_API_BASE_URL}/api/meal-windows/calculate`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -354,7 +399,9 @@ export function CalendarView() {
         body: JSON.stringify({
           date: selectedDate,
           user_id: 'default_user',
-          // Using default sleep_time: '00:00' and wake_time: '08:00'
+          events: dayEvents,
+          sleep_time: sleepTime,
+          wake_time: wakeTime,
         }),
       });
 

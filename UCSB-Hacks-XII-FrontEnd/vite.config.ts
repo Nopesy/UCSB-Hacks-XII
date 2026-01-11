@@ -20,6 +20,11 @@ export default defineConfig({
     // During development forward /api requests to the local backend
     proxy: {
       '/api': 'http://localhost:3001',
+      '/calendar-api': {
+      target: 'http://localhost:5001', 
+      changeOrigin: true,
+      rewrite: (path) => path.replace(/^\/calendar-api/, ''),
     },
   },
+ },
 })
