@@ -4,12 +4,17 @@ Quick script to test API key and list available models
 import os
 from google import genai
 
-api_key = os.getenv('GEMINI_API_KEY', 'gen-lang-client-0058781768')
+# Support both GEMINI_API_KEY (legacy) and GOOGLE_API_KEY
+api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY', 'gen-lang-client-0058781768')
 
 print(f"Testing API key: {api_key[:20]}...")
 
+# Set GOOGLE_API_KEY for genai.Client() to pick up automatically
+if not os.getenv('GOOGLE_API_KEY'):
+    os.environ['GOOGLE_API_KEY'] = api_key
+
 try:
-    client = genai.Client(api_key=api_key)
+    client = genai.Client()
 
     # Try listing models
     print("\nAttempting to list models...")
@@ -24,7 +29,7 @@ except Exception as e:
     print("\nTrying a simple generation request with gemini-1.5-flash...")
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client()
         response = client.models.generate_content(
             model='gemini-1.5-flash',
             contents='Say hello'

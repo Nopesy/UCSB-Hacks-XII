@@ -10,6 +10,8 @@ import json
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from google import genai
+from calendar_agent import calculate_nap_time_tool, calculate_meal_windows_tool, predict_burnout_tool, predict_burnout_batch_tool, load_burnout_cache
 import secrets
 
 # Allow HTTP for local development (disable HTTPS requirement)
@@ -48,6 +50,12 @@ def oauth_initiate():
         data = request.json
         user_id = data.get('user_id', 'default_user')
 
+        # Check if credentials file exists
+        if not os.path.exists(CLIENT_SECRETS_FILE):
+            error_msg = f"Credentials file '{CLIENT_SECRETS_FILE}' not found. Please create it from Google Cloud Console."
+            print(f"ERROR: {error_msg}", flush=True)
+            return jsonify({"error": error_msg}), 500
+
         # Store user_id in session
         session['user_id'] = user_id
 
@@ -73,7 +81,11 @@ def oauth_initiate():
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        error_msg = str(e)
+        print(f"ERROR in oauth_initiate: {error_msg}", flush=True)
+        print(f"Traceback: {traceback.format_exc()}", flush=True)
+        return jsonify({"error": error_msg}), 500
 
 
 @app.route('/oauth/callback', methods=['GET'])
@@ -377,6 +389,392 @@ def auth_status():
         })
 
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/gemini/chat', methods=['POST'])
+def gemini_chat():
+    """
+    Chat with Gemini AI
+    Accepts natural language queries and returns AI responses
+    """
+    try:
+        data = request.json
+        query = data.get('query', '')
+        model = data.get('model', 'gemini-3-flash-preview')
+        user_id = data.get('user_id', 'default_user')
+
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+
+        # Get API key - support both GEMINI_API_KEY (legacy) and GOOGLE_API_KEY
+        api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY')
+
+        if not api_key:
+            return jsonify({
+                "error": "GOOGLE_API_KEY or GEMINI_API_KEY not found",
+                "message": "Get one from: https://aistudio.google.com/app/apikey"
+            }), 500
+
+        # Set GOOGLE_API_KEY for genai.Client() to pick up automatically
+        if not os.getenv('GOOGLE_API_KEY'):
+            os.environ['GOOGLE_API_KEY'] = api_key
+
+        # Create client - will automatically use GOOGLE_API_KEY from environment
+        client = genai.Client()
+
+        # Optionally include calendar context if user is authenticated
+        context = ""
+        user_calendars_path = os.path.join(USERS_DIR, f"{user_id}_calendars.json")
+        if os.path.exists(user_calendars_path):
+            try:
+                with open(user_calendars_path, 'r') as f:
+                    calendar_data = json.load(f)
+                    events = calendar_data.get('events', [])
+                    if events:
+                        # Add recent events as context
+                        recent_events = events[:10]  # Last 10 events
+                        context = "\n\nUser's recent calendar events:\n"
+                        for event in recent_events:
+                            summary = event.get('summary', 'No title')
+                            start = event.get('start', {}).get('dateTime', event.get('start', {}).get('date', 'Unknown'))
+                            context += f"- {summary} at {start}\n"
+            except Exception as e:
+                print(f"DEBUG: Error loading calendar context: {e}", flush=True)
+
+        # Build the prompt with optional context
+        full_query = query
+        if context:
+            full_query = f"{query}\n{context}"
+
+        # Generate response using Gemini
+        response = client.models.generate_content(
+            model=model,
+            contents=full_query,
+        )
+
+        return jsonify({
+            "success": True,
+            "response": response.text,
+            "model": model
+        })
+
+    except Exception as e:
+        import traceback
+        print(f"DEBUG: Exception in gemini_chat: {str(e)}", flush=True)
+        print(f"DEBUG: Traceback: {traceback.format_exc()}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/nap-times/calculate', methods=['POST'])
+def calculate_nap_times():
+    """
+    Calculate optimal nap times for a given date
+    Returns JSON array of suggested nap events that can be appended to calendar
+    """
+    try:
+        data = request.json
+        date_str = data.get('date')  # ISO format 'YYYY-MM-DD'
+        user_id = data.get('user_id', 'default_user')
+        sleep_time = data.get('sleep_time', '00:00')  # 24-hour format 'HH:MM', default midnight
+        wake_time = data.get('wake_time', '08:00')  # 24-hour format 'HH:MM', default 8 AM
+
+        if not date_str:
+            return jsonify({"error": "Date is required (format: YYYY-MM-DD)"}), 400
+
+        # Validate time formats
+        try:
+            # Validate sleep_time format
+            sleep_hour, sleep_minute = map(int, sleep_time.split(':'))
+            if not (0 <= sleep_hour <= 23 and 0 <= sleep_minute <= 59):
+                return jsonify({"error": "Invalid sleep_time format. Use 24-hour format 'HH:MM' (00:00-23:59)"}), 400
+            
+            # Validate wake_time format
+            wake_hour, wake_minute = map(int, wake_time.split(':'))
+            if not (0 <= wake_hour <= 23 and 0 <= wake_minute <= 59):
+                return jsonify({"error": "Invalid wake_time format. Use 24-hour format 'HH:MM' (00:00-23:59)"}), 400
+        except (ValueError, AttributeError):
+            return jsonify({"error": "Invalid time format. Use 24-hour format 'HH:MM' (e.g., '00:00' or '08:00')"}), 400
+
+        # Call the calculate_nap_time_tool function
+        result_json = calculate_nap_time_tool(date_str, user_id=user_id, 
+                                             sleep_time=sleep_time, wake_time=wake_time)
+        
+        # Parse the JSON response
+        result_data = json.loads(result_json)
+        
+        # Check if there's an error
+        if 'error' in result_data:
+            return jsonify(result_data), 500
+        
+        # Return the nap recommendations as JSON
+        return jsonify({
+            "success": True,
+            "date": date_str,
+            "events": result_data.get('events', []),
+            "summary": result_data.get('summary', ''),
+            "count": result_data.get('count', 0)
+        })
+
+    except json.JSONDecodeError as e:
+        return jsonify({
+            "error": "Failed to parse nap time calculation result",
+            "details": str(e)
+        }), 500
+    except Exception as e:
+        import traceback
+        print(f"DEBUG: Exception in calculate_nap_times: {str(e)}", flush=True)
+        print(f"DEBUG: Traceback: {traceback.format_exc()}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/meal-windows/calculate', methods=['POST'])
+def calculate_meal_windows():
+    """
+    Calculate optimal meal windows for a given date
+    Returns JSON array of suggested meal events that can be appended to calendar
+    """
+    try:
+        data = request.json
+        date_str = data.get('date')  # ISO format 'YYYY-MM-DD'
+        user_id = data.get('user_id', 'default_user')
+        sleep_time = data.get('sleep_time', '00:00')  # 24-hour format 'HH:MM', default midnight
+        wake_time = data.get('wake_time', '08:00')  # 24-hour format 'HH:MM', default 8 AM
+
+        if not date_str:
+            return jsonify({"error": "Date is required (format: YYYY-MM-DD)"}), 400
+
+        # Validate time formats
+        try:
+            # Validate sleep_time format
+            sleep_hour, sleep_minute = map(int, sleep_time.split(':'))
+            if not (0 <= sleep_hour <= 23 and 0 <= sleep_minute <= 59):
+                return jsonify({"error": "Invalid sleep_time format. Use 24-hour format 'HH:MM' (00:00-23:59)"}), 400
+            
+            # Validate wake_time format
+            wake_hour, wake_minute = map(int, wake_time.split(':'))
+            if not (0 <= wake_hour <= 23 and 0 <= wake_minute <= 59):
+                return jsonify({"error": "Invalid wake_time format. Use 24-hour format 'HH:MM' (00:00-23:59)"}), 400
+        except (ValueError, AttributeError):
+            return jsonify({"error": "Invalid time format. Use 24-hour format 'HH:MM' (e.g., '00:00' or '08:00')"}), 400
+
+        # Call the calculate_meal_windows_tool function
+        result_json = calculate_meal_windows_tool(date_str, user_id=user_id, 
+                                                 sleep_time=sleep_time, wake_time=wake_time)
+        
+        # Parse the JSON response
+        result_data = json.loads(result_json)
+        
+        # Check if there's an error
+        if 'error' in result_data:
+            return jsonify(result_data), 500
+        
+        # Return the meal recommendations as JSON
+        return jsonify({
+            "success": True,
+            "date": date_str,
+            "events": result_data.get('events', []),
+            "summary": result_data.get('summary', ''),
+            "count": result_data.get('count', 0)
+        })
+
+    except json.JSONDecodeError as e:
+        return jsonify({
+            "error": "Failed to parse meal window calculation result",
+            "details": str(e)
+        }), 500
+    except Exception as e:
+        import traceback
+        print(f"DEBUG: Exception in calculate_meal_windows: {str(e)}", flush=True)
+        print(f"DEBUG: Traceback: {traceback.format_exc()}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/burnout/predict', methods=['POST'])
+def predict_burnout():
+    """
+    Predict burnout score for a given date
+    Uses cached predictions if available, otherwise calculates for next 14 days
+    Returns JSON with burnout score (0-100), status, reasoning, and recommendations
+    """
+    try:
+        from datetime import datetime, timedelta
+        
+        data = request.json
+        date_str = data.get('date')  # ISO format 'YYYY-MM-DD'
+        user_id = data.get('user_id', 'default_user')
+        sleep_time = data.get('sleep_time', '00:00')  # 24-hour format 'HH:MM', default midnight
+        wake_time = data.get('wake_time', '08:00')  # 24-hour format 'HH:MM', default 8 AM
+
+        if not date_str:
+            return jsonify({"error": "Date is required (format: YYYY-MM-DD)"}), 400
+
+        # Validate time formats
+        try:
+            # Validate sleep_time format
+            sleep_hour, sleep_minute = map(int, sleep_time.split(':'))
+            if not (0 <= sleep_hour <= 23 and 0 <= sleep_minute <= 59):
+                return jsonify({"error": "Invalid sleep_time format. Use 24-hour format 'HH:MM' (00:00-23:59)"}), 400
+            
+            # Validate wake_time format
+            wake_hour, wake_minute = map(int, wake_time.split(':'))
+            if not (0 <= wake_hour <= 23 and 0 <= wake_minute <= 59):
+                return jsonify({"error": "Invalid wake_time format. Use 24-hour format 'HH:MM' (00:00-23:59)"}), 400
+        except (ValueError, AttributeError):
+            return jsonify({"error": "Invalid time format. Use 24-hour format 'HH:MM' (e.g., '00:00' or '08:00')"}), 400
+
+        # Check cache first
+        cache = load_burnout_cache(user_id=user_id)
+        
+        # Check if we need to refresh cache (if date is not in cache or cache is outdated)
+        today = datetime.now().date()
+        target_date = datetime.fromisoformat(date_str).date()
+        days_ahead = (target_date - today).days
+        
+        # If date is not in cache or more than 14 days ahead, calculate batch
+        needs_refresh = False
+        if date_str not in cache:
+            needs_refresh = True
+        else:
+            # Check if cache covers next 14 days
+            cache_dates = set(cache.keys())
+            expected_dates = set()
+            for i in range(14):
+                expected_date = (today + timedelta(days=i)).isoformat()
+                expected_dates.add(expected_date)
+            
+            if not expected_dates.issubset(cache_dates):
+                needs_refresh = True
+        
+        # If cache needs refresh, calculate for next 14 days
+        if needs_refresh:
+            print(f"DEBUG: Refreshing burnout cache for next 14 days", flush=True)
+            batch_result_json = predict_burnout_batch_tool(
+                user_id=user_id,
+                sleep_time=sleep_time,
+                wake_time=wake_time,
+                days_ahead=14
+            )
+            batch_result = json.loads(batch_result_json)
+            
+            if 'error' in batch_result:
+                # Fallback to single date prediction
+                print(f"DEBUG: Batch prediction failed, falling back to single date", flush=True)
+                result_json = predict_burnout_tool(date_str, user_id=user_id, 
+                                                  sleep_time=sleep_time, wake_time=wake_time)
+                result_data = json.loads(result_json)
+                
+                if 'error' in result_data:
+                    return jsonify(result_data), 500
+                
+                return jsonify({
+                    "success": True,
+                    "date": date_str,
+                    "score": result_data.get('score', 50),
+                    "status": result_data.get('status', 'building'),
+                    "reasoning": result_data.get('reasoning', ''),
+                    "key_factors": result_data.get('key_factors', []),
+                    "recommendations": result_data.get('recommendations', []),
+                    "cached": False
+                })
+            else:
+                # Reload cache after batch calculation
+                cache = load_burnout_cache(user_id=user_id)
+        
+        # Get prediction from cache
+        if date_str in cache:
+            prediction = cache[date_str]
+            return jsonify({
+                "success": True,
+                "date": date_str,
+                "score": prediction.get('score', 50),
+                "status": prediction.get('status', 'building'),
+                "reasoning": prediction.get('reasoning', ''),
+                "key_factors": [],  # Not stored in cache
+                "recommendations": [],  # Not stored in cache
+                "cached": True
+            })
+        else:
+            # Date not in cache and batch calculation didn't include it
+            # Fallback to single date prediction
+            result_json = predict_burnout_tool(date_str, user_id=user_id, 
+                                              sleep_time=sleep_time, wake_time=wake_time)
+            result_data = json.loads(result_json)
+            
+            if 'error' in result_data:
+                return jsonify(result_data), 500
+            
+            return jsonify({
+                "success": True,
+                "date": date_str,
+                "score": result_data.get('score', 50),
+                "status": result_data.get('status', 'building'),
+                "reasoning": result_data.get('reasoning', ''),
+                "key_factors": result_data.get('key_factors', []),
+                "recommendations": result_data.get('recommendations', []),
+                "cached": False
+            })
+
+    except json.JSONDecodeError as e:
+        return jsonify({
+            "error": "Failed to parse burnout prediction result",
+            "details": str(e)
+        }), 500
+    except Exception as e:
+        import traceback
+        print(f"DEBUG: Exception in predict_burnout: {str(e)}", flush=True)
+        print(f"DEBUG: Traceback: {traceback.format_exc()}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/burnout/refresh-cache', methods=['POST'])
+def refresh_burnout_cache():
+    """
+    Manually refresh the burnout prediction cache for the next 14 days
+    Useful for pre-calculating predictions after calendar sync
+    """
+    try:
+        data = request.json or {}
+        user_id = data.get('user_id', 'default_user')
+        sleep_time = data.get('sleep_time', '00:00')
+        wake_time = data.get('wake_time', '08:00')
+        days_ahead = data.get('days_ahead', 14)
+
+        # Validate time formats
+        try:
+            sleep_hour, sleep_minute = map(int, sleep_time.split(':'))
+            if not (0 <= sleep_hour <= 23 and 0 <= sleep_minute <= 59):
+                return jsonify({"error": "Invalid sleep_time format. Use 24-hour format 'HH:MM' (00:00-23:59)"}), 400
+            
+            wake_hour, wake_minute = map(int, wake_time.split(':'))
+            if not (0 <= wake_hour <= 23 and 0 <= wake_minute <= 59):
+                return jsonify({"error": "Invalid wake_time format. Use 24-hour format 'HH:MM' (00:00-23:59)"}), 400
+        except (ValueError, AttributeError):
+            return jsonify({"error": "Invalid time format. Use 24-hour format 'HH:MM' (e.g., '00:00' or '08:00')"}), 400
+
+        # Calculate batch predictions
+        result_json = predict_burnout_batch_tool(
+            user_id=user_id,
+            sleep_time=sleep_time,
+            wake_time=wake_time,
+            days_ahead=days_ahead
+        )
+        
+        result_data = json.loads(result_json)
+        
+        if 'error' in result_data:
+            return jsonify(result_data), 500
+        
+        return jsonify({
+            "success": True,
+            "message": f"Cache refreshed for {days_ahead} days",
+            "predictions_count": len(result_data.get('predictions', {}))
+        })
+
+    except Exception as e:
+        import traceback
+        print(f"DEBUG: Exception in refresh_burnout_cache: {str(e)}", flush=True)
+        print(f"DEBUG: Traceback: {traceback.format_exc()}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
