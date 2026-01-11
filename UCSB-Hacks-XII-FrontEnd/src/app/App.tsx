@@ -8,6 +8,14 @@ import { useEffect, useState } from 'react';
 import { Login } from './components/Login';
 import { SleepCheckInModal } from './components/SleepCheckInModal';
 
+interface WeekDayData {
+  day: string;
+  date: string;
+  score: number;
+  status: string;
+  cortisol: number[];
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'calendar'>('dashboard');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -15,6 +23,9 @@ export default function App() {
   const [sleep, setSleep] = useState<{ sleepTime: string; wakeTime: string } | null>(null);
   const [showSleepModal, setShowSleepModal] = useState(false);
   const [sleepError, setSleepError] = useState<string | null>(null);
+  
+  const [weekData, setWeekData] = useState<WeekDayData[]>([]);
+  const [isLoadingBurnout, setIsLoadingBurnout] = useState(true);
 
   const formatTime = (t: string) => {
     try {
@@ -69,17 +80,118 @@ export default function App() {
     setSleep(data);
     setShowSleepModal(false);
     setSleepError(null);
+    // Refresh burnout data with new sleep times
+    fetchBurnoutData(data.sleepTime, data.wakeTime);
   };
 
-  const weekData = [
-    { day: 'Mon', date: '1/6', score: 28, status: 'stable', cortisol: [20, 25, 30, 35, 25, 20] },
-    { day: 'Tue', date: '1/7', score: 42, status: 'building', cortisol: [25, 35, 45, 50, 40, 30] },
-    { day: 'Wed', date: '1/8', score: 35, status: 'stable', cortisol: [22, 28, 32, 35, 28, 24] },
-    { day: 'Thu', date: '1/9', score: 68, status: 'high-risk', cortisol: [30, 45, 60, 70, 65, 50] },
-    { day: 'Fri', date: '1/10', score: 71, status: 'high-risk', cortisol: [35, 50, 65, 75, 68, 55] },
-    { day: 'Sat', date: '1/11', score: 45, status: 'building', cortisol: [28, 38, 48, 52, 42, 32] },
-    { day: 'Sun', date: '1/12', score: 32, status: 'stable', cortisol: [18, 22, 28, 30, 25, 20] },
-  ];
+  // Fetch burnout predictions for the week
+  const fetchBurnoutData = async (sleepTime?: string, wakeTime?: string) => {
+    setIsLoadingBurnout(true);
+    try {
+      // Generate dates for the week (last 3 days + today + next 3 days)
+      const dates: string[] = [];
+      const today = new Date();
+      for (let i = -3; i <= 3; i++) {
+        const date = new Date(today);
+        date.setDate(date.getDate() + i);
+        dates.push(date.toISOString().split('T')[0]);
+      }
+
+      // Fetch events from MongoDB first
+      const startDate = dates[0];
+      const endDate = dates[dates.length - 1];
+      let allEvents: any[] = [];
+      try {
+        const eventsRes = await fetch(`http://localhost:3001/api/events?user_id=default_user&start=${startDate}&end=${endDate}`);
+        if (eventsRes.ok) {
+          const eventsData = await eventsRes.json();
+          allEvents = eventsData.events || [];
+        }
+      } catch (err) {
+        console.error('Failed to fetch events from MongoDB:', err);
+      }
+
+      // Fetch burnout predictions for each day
+      const predictions = await Promise.all(
+        dates.map(async (date) => {
+          try {
+            const response = await fetch('http://localhost:5001/api/burnout/predict', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                date,
+                user_id: 'default_user',
+                sleep_time: sleepTime || sleep?.sleepTime || '00:00',
+                wake_time: wakeTime || sleep?.wakeTime || '08:00',
+                events: allEvents
+              })
+            });
+
+            if (!response.ok) {
+              console.error(`Failed to fetch burnout for ${date}`);
+              return null;
+            }
+
+            const data = await response.json();
+            return {
+              date,
+              score: data.score || 50,
+              status: data.status || 'building'
+            };
+          } catch (error) {
+            console.error(`Error fetching burnout for ${date}:`, error);
+            return null;
+          }
+        })
+      );
+
+      // Transform predictions into weekData format
+      const formattedWeekData: WeekDayData[] = predictions
+        .filter((p): p is NonNullable<typeof p> => p !== null)
+        .map((prediction, index) => {
+          const date = new Date(prediction.date);
+          const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+          
+          // Generate cortisol curve based on score (simulate hourly data)
+          const generateCortisolCurve = (score: number): number[] => {
+            const baseLevel = 20;
+            const stressMultiplier = score / 100;
+            // Simulate cortisol pattern: rise in morning, peak midday, decline evening
+            return [
+              baseLevel + (10 * stressMultiplier),
+              baseLevel + (20 * stressMultiplier),
+              baseLevel + (30 * stressMultiplier),
+              baseLevel + (35 * stressMultiplier),
+              baseLevel + (25 * stressMultiplier),
+              baseLevel + (15 * stressMultiplier)
+            ].map(v => Math.round(v));
+          };
+
+          return {
+            day: dayNames[date.getDay()],
+            date: `${date.getMonth() + 1}/${date.getDate()}`,
+            score: prediction.score,
+            status: prediction.status,
+            cortisol: generateCortisolCurve(prediction.score)
+          };
+        });
+
+      setWeekData(formattedWeekData);
+    } catch (error) {
+      console.error('Error fetching burnout data:', error);
+      // Fallback to empty data
+      setWeekData([]);
+    } finally {
+      setIsLoadingBurnout(false);
+    }
+  };
+
+  // Load burnout data on mount or when sleep data changes
+  useEffect(() => {
+    if (sleep) {
+      fetchBurnoutData(sleep.sleepTime, sleep.wakeTime);
+    }
+  }, [sleep]);
 
   const todayCortisolData = [
     { hour: '6am', level: 35 },
@@ -183,7 +295,25 @@ export default function App() {
           <>
             {/* 7-Day Burnout Radar */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7 gap-4 mb-8">
-              {weekData.map((day, index) => (
+              {isLoadingBurnout ? (
+                // Loading skeleton
+                Array.from({ length: 7 }).map((_, index) => (
+                  <div
+                    key={index}
+                    className="bg-card rounded-2xl p-5 shadow-sm border border-border/50 animate-pulse"
+                  >
+                    <div className="h-12 bg-muted rounded mb-4" />
+                    <div className="h-8 bg-muted rounded mb-2" />
+                    <div className="h-12 bg-muted rounded" />
+                  </div>
+                ))
+              ) : weekData.length === 0 ? (
+                // Empty state
+                <div className="col-span-full text-center py-12 text-muted-foreground">
+                  No burnout data available. Please sync your calendar and ensure your sleep schedule is set.
+                </div>
+              ) : (
+                weekData.map((day, index) => (
                 <div
                   key={index}
                   className="bg-card rounded-2xl p-5 shadow-sm border border-border/50 hover:shadow-md transition-shadow"
@@ -232,7 +362,8 @@ export default function App() {
                     })}
                   </div>
                 </div>
-              ))}
+              ))
+              )}
             </div>
 
             {/* Cortisol Chart & Metrics */}
@@ -258,10 +389,6 @@ export default function App() {
           <>
             <CalendarView />
 
-            {/* Fix My Week Button */}
-            <button className="w-full bg-primary text-primary-foreground py-4 rounded-xl hover:opacity-90 transition-opacity shadow-lg shadow-primary/20 mt-8">
-              Fix My Week
-            </button>
           </>
         )}
         <SleepCheckInModal

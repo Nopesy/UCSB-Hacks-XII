@@ -825,7 +825,7 @@ Return meal recommendations for breakfast, lunch, and dinner (and snacks only if
                     try:
                         response = client.models.generate_content(
                             model=model,
-                            contents=burnout_prompt,
+                            contents=meal_prompt,
                         )
                         gemini_response = response.text
                         break
@@ -845,7 +845,7 @@ Return meal recommendations for breakfast, lunch, and dinner (and snacks only if
         # If all SDK models failed, try REST API as fallback
         if not gemini_response:
             print("All SDK models failed, trying REST API fallback...", flush=True)
-            gemini_response = _try_rest_api_fallback(api_key, burnout_prompt, last_error)
+            gemini_response = _try_rest_api_fallback(api_key, meal_prompt, last_error)
         
         if not gemini_response:
             raise Exception(f"All models exhausted (SDK and REST API). Last error: {last_error}")

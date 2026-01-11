@@ -46,8 +46,10 @@ export function CalendarView() {
   const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
   const years = Array.from({length: 11}, (_, i) => 2020 + i);
 
-  const [viewYear, setViewYear] = useState<number>(2026);
-  const [viewMonth, setViewMonth] = useState<number>(0); // 0 = Jan
+  // Initialize to today's date
+  const today = new Date();
+  const [viewYear, setViewYear] = useState<number>(today.getFullYear());
+  const [viewMonth, setViewMonth] = useState<number>(today.getMonth()); // 0 = Jan, 11 = Dec
   const [viewMode, setViewMode] = useState<'month'|'week'>('month');
 
   // Clear event selection when switching view modes
@@ -56,7 +58,10 @@ export function CalendarView() {
   }, [viewMode]);
 
   const pad = (n: number) => String(n).padStart(2, '0');
-  const [selectedDate, setSelectedDate] = useState<string | null>(`${viewYear}-${pad(viewMonth+1)}-10`);
+  const [selectedDate, setSelectedDate] = useState<string | null>(() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  });
   const [selectedSlot, setSelectedSlot] = useState<{iso: string; hour: number; eventId?: string} | null>(null);
   const hours = Array.from({ length: 24 }, (_, i) => i); // 0 - 23 (12am - 11pm)
   const formatHour = (h: number) => {
@@ -305,12 +310,17 @@ export function CalendarView() {
     setNapError(null);
     setNapEvents([]);
 
-    // Filter events for the selected date
-    const dayEvents = events.filter(e => {
-      const eventDate = new Date(e.startTs);
-      const iso = `${eventDate.getFullYear()}-${pad(eventDate.getMonth()+1)}-${pad(eventDate.getDate())}`;
-      return iso === selectedDate;
-    });
+    // Fetch all events from MongoDB (not just filtered ones)
+    let allEvents: any[] = [];
+    try {
+      const eventsRes = await fetch(`${EVENTS_API_BASE_URL}/api/events?user_id=default_user&start=${selectedDate}&end=${selectedDate}`);
+      if (eventsRes.ok) {
+        const eventsData = await eventsRes.json();
+        allEvents = eventsData.events || [];
+      }
+    } catch (err) {
+      console.error('Failed to fetch events from MongoDB:', err);
+    }
 
     // Fetch sleep entry for the selected date
     let sleepTime = '00:00';
@@ -335,7 +345,7 @@ export function CalendarView() {
         body: JSON.stringify({
           date: selectedDate,
           user_id: 'default_user',
-          events: dayEvents,
+          events: allEvents,
           sleep_time: sleepTime,
           wake_time: wakeTime,
         }),
@@ -369,12 +379,17 @@ export function CalendarView() {
     setMealError(null);
     setMealEvents([]);
 
-    // Filter events for the selected date
-    const dayEvents = events.filter(e => {
-      const eventDate = new Date(e.startTs);
-      const iso = `${eventDate.getFullYear()}-${pad(eventDate.getMonth()+1)}-${pad(eventDate.getDate())}`;
-      return iso === selectedDate;
-    });
+    // Fetch all events from MongoDB (not just filtered ones)
+    let allEvents: any[] = [];
+    try {
+      const eventsRes = await fetch(`${EVENTS_API_BASE_URL}/api/events?user_id=default_user&start=${selectedDate}&end=${selectedDate}`);
+      if (eventsRes.ok) {
+        const eventsData = await eventsRes.json();
+        allEvents = eventsData.events || [];
+      }
+    } catch (err) {
+      console.error('Failed to fetch events from MongoDB:', err);
+    }
 
     // Fetch sleep entry for the selected date
     let sleepTime = '00:00';
@@ -399,7 +414,7 @@ export function CalendarView() {
         body: JSON.stringify({
           date: selectedDate,
           user_id: 'default_user',
-          events: dayEvents,
+          events: allEvents,
           sleep_time: sleepTime,
           wake_time: wakeTime,
         }),
