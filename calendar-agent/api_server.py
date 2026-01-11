@@ -401,7 +401,7 @@ def gemini_chat():
     try:
         data = request.json
         query = data.get('query', '')
-        model = data.get('model', 'gemini-3-flash-preview')
+        model = data.get('model', 'gemini-3-flash')
         user_id = data.get('user_id', 'default_user')
 
         if not query:
@@ -496,9 +496,19 @@ def calculate_nap_times():
         except (ValueError, AttributeError):
             return jsonify({"error": "Invalid time format. Use 24-hour format 'HH:MM' (e.g., '00:00' or '08:00')"}), 400
 
+        # Check if events are provided in request (from MongoDB)
+        provided_events = data.get('events', None)
+        
         # Call the calculate_nap_time_tool function
-        result_json = calculate_nap_time_tool(date_str, user_id=user_id, 
-                                             sleep_time=sleep_time, wake_time=wake_time)
+        if provided_events:
+            # Use provided events from MongoDB
+            result_json = calculate_nap_time_tool(date_str, user_id=user_id, 
+                                                 sleep_time=sleep_time, wake_time=wake_time,
+                                                 provided_events=provided_events)
+        else:
+            # Load from JSON files (legacy)
+            result_json = calculate_nap_time_tool(date_str, user_id=user_id, 
+                                                 sleep_time=sleep_time, wake_time=wake_time)
         
         # Parse the JSON response
         result_data = json.loads(result_json)
@@ -558,9 +568,19 @@ def calculate_meal_windows():
         except (ValueError, AttributeError):
             return jsonify({"error": "Invalid time format. Use 24-hour format 'HH:MM' (e.g., '00:00' or '08:00')"}), 400
 
+        # Check if events are provided in request (from MongoDB)
+        provided_events = data.get('events', None)
+        
         # Call the calculate_meal_windows_tool function
-        result_json = calculate_meal_windows_tool(date_str, user_id=user_id, 
-                                                 sleep_time=sleep_time, wake_time=wake_time)
+        if provided_events:
+            # Use provided events from MongoDB
+            result_json = calculate_meal_windows_tool(date_str, user_id=user_id, 
+                                                     sleep_time=sleep_time, wake_time=wake_time,
+                                                     provided_events=provided_events)
+        else:
+            # Load from JSON files (legacy)
+            result_json = calculate_meal_windows_tool(date_str, user_id=user_id, 
+                                                     sleep_time=sleep_time, wake_time=wake_time)
         
         # Parse the JSON response
         result_data = json.loads(result_json)
@@ -623,8 +643,9 @@ def predict_burnout():
         except (ValueError, AttributeError):
             return jsonify({"error": "Invalid time format. Use 24-hour format 'HH:MM' (e.g., '00:00' or '08:00')"}), 400
 
-        # Check cache first
+        # Check cache first (ensure we're using the correct user_id)
         cache = load_burnout_cache(user_id=user_id)
+        print(f"DEBUG: Loading cache for user_id={user_id}, cache keys: {list(cache.keys())[:5]}...", flush=True)
         
         # Check if we need to refresh cache (if date is not in cache or cache is outdated)
         today = datetime.now().date()
@@ -646,6 +667,9 @@ def predict_burnout():
             if not expected_dates.issubset(cache_dates):
                 needs_refresh = True
         
+        # Check if events are provided in request (from MongoDB)
+        provided_events = data.get('events', None)
+        
         # If cache needs refresh, calculate for next 14 days
         if needs_refresh:
             print(f"DEBUG: Refreshing burnout cache for next 14 days", flush=True)
@@ -653,7 +677,8 @@ def predict_burnout():
                 user_id=user_id,
                 sleep_time=sleep_time,
                 wake_time=wake_time,
-                days_ahead=14
+                days_ahead=14,
+                provided_events=provided_events
             )
             batch_result = json.loads(batch_result_json)
             
@@ -661,7 +686,8 @@ def predict_burnout():
                 # Fallback to single date prediction
                 print(f"DEBUG: Batch prediction failed, falling back to single date", flush=True)
                 result_json = predict_burnout_tool(date_str, user_id=user_id, 
-                                                  sleep_time=sleep_time, wake_time=wake_time)
+                                                  sleep_time=sleep_time, wake_time=wake_time,
+                                                  provided_events=provided_events)
                 result_data = json.loads(result_json)
                 
                 if 'error' in result_data:
@@ -684,6 +710,7 @@ def predict_burnout():
         # Get prediction from cache
         if date_str in cache:
             prediction = cache[date_str]
+            print(f"DEBUG: Returning cached prediction for {date_str}: score={prediction.get('score')}, status={prediction.get('status')}", flush=True)
             return jsonify({
                 "success": True,
                 "date": date_str,
@@ -698,7 +725,8 @@ def predict_burnout():
             # Date not in cache and batch calculation didn't include it
             # Fallback to single date prediction
             result_json = predict_burnout_tool(date_str, user_id=user_id, 
-                                              sleep_time=sleep_time, wake_time=wake_time)
+                                              sleep_time=sleep_time, wake_time=wake_time,
+                                              provided_events=provided_events)
             result_data = json.loads(result_json)
             
             if 'error' in result_data:
