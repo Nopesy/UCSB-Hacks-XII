@@ -3,6 +3,7 @@ import { BurnoutMetrics } from './components/burnout-metrics';
 import { VoiceCheckIn } from './components/voice-checkin';
 import { ActivitySummary } from './components/activity-summary';
 import { CalendarView } from './components/calendar-view';
+import { EventRating } from './components/event-rating';
 import { useEffect, useState } from 'react';
 import { Login } from './components/Login';
 import { SleepCheckInModal } from './components/SleepCheckInModal';
@@ -236,8 +237,9 @@ export default function App() {
 
             {/* Cortisol Chart & Metrics */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-              <div>
+              <div className="space-y-6">
                 <CortisolChart data={todayCortisolData} color="#fb7185" />
+                <EventRating />
               </div>
               <div className="space-y-6">
                 <BurnoutMetrics
@@ -248,16 +250,20 @@ export default function App() {
                 <VoiceCheckIn />
               </div>
             </div>
-
-            {/* Fix My Week Button */}
-            <button className="w-full bg-primary text-primary-foreground py-4 rounded-xl hover:opacity-90 transition-opacity shadow-lg shadow-primary/20">
-              Fix My Week
-            </button>
           </>
         )}
 
         {/* Calendar View */}
-        {activeTab === 'calendar' && <CalendarView />}
+        {activeTab === 'calendar' && (
+          <>
+            <CalendarView />
+
+            {/* Fix My Week Button */}
+            <button className="w-full bg-primary text-primary-foreground py-4 rounded-xl hover:opacity-90 transition-opacity shadow-lg shadow-primary/20 mt-8">
+              Fix My Week
+            </button>
+          </>
+        )}
         <SleepCheckInModal
           isOpen={showSleepModal}
           onClose={() => setShowSleepModal(false)}

@@ -24,7 +24,7 @@ export function CalendarSync() {
   const [error, setError] = useState<string | null>(null);
   const [showCalendarList, setShowCalendarList] = useState(false);
 
-  const API_BASE = 'http://localhost:5001';
+  const API_BASE = '/calendar-api';
   const userId = 'default_user'; // In production, get from auth context
 
   useEffect(() => {
@@ -94,8 +94,8 @@ export function CalendarSync() {
 
         // Listen for message from popup
         const messageHandler = (event: MessageEvent) => {
-          // Verify the message is from our backend
-          if (event.origin !== 'http://localhost:5001') return;
+          // Verify the message is from our backend (port 5001 during OAuth)
+          if (event.origin !== 'http://localhost:5001' && event.origin !== window.location.origin) return;
 
           if (event.data.type === 'oauth-success') {
             window.removeEventListener('message', messageHandler);
