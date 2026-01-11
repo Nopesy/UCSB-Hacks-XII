@@ -10,6 +10,7 @@ from google import genai
 from google.genai import types
 from calendar_tools import get_calendar_tool_instance
 import requests
+import time
 
 
 # Initialize calendar lazily (only when needed)
@@ -25,6 +26,52 @@ def get_calendar():
             # Calendar tool not available (no token.json) - that's okay for API server
             calendar = None
     return calendar
+
+
+def _try_rest_api_fallback(api_key: str, prompt: str, last_error: Exception = None) -> str:
+    """Fallback to REST API when SDK models fail"""
+    # Try models that have available quota
+    rest_models = [
+        'gemini-3-flash',  # 4/5 RPM available
+        'gemini-2.5-flash',  # Available
+        'gemini-2.5-flash-lite',  # Available
+        'gemma-3-12b',  # Available
+        'gemma-3-4b',  # Available
+    ]
+    
+    url_template = 'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}'
+    
+    for model in rest_models:
+        try:
+            url = url_template.format(model=model, key=api_key)
+            payload = {
+                "contents": [{
+                    "parts": [{"text": prompt}]
+                }]
+            }
+            
+            response = requests.post(url, json=payload, timeout=60)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if 'candidates' in result and len(result['candidates']) > 0:
+                    content = result['candidates'][0].get('content', {})
+                    parts = content.get('parts', [])
+                    if parts and 'text' in parts[0]:
+                        print(f"✅ REST API fallback succeeded with {model}", flush=True)
+                        return parts[0]['text']
+            elif response.status_code == 429:
+                print(f"⚠️  REST API model {model} quota exceeded, trying next...", flush=True)
+                continue
+            else:
+                print(f"⚠️  REST API model {model} failed: {response.status_code}, trying next...", flush=True)
+                continue
+                
+        except Exception as e:
+            print(f"⚠️  REST API model {model} error: {str(e)[:100]}, trying next...", flush=True)
+            continue
+    
+    return None
 
 
 # System prompt with ATUS insights
@@ -148,7 +195,8 @@ def fetch_events_from_node_api(user_id: str, start_date: str, end_date: str, nod
 
 
 def calculate_nap_time_tool(date_str: str, user_id: str = 'default_user', 
-                            sleep_time: str = '00:00', wake_time: str = '08:00') -> str:
+                            sleep_time: str = '00:00', wake_time: str = '08:00',
+                            provided_events: list = None) -> str:
     """Calculate optimal nap times and windows for a given day using Gemini AI
     
     Analyzes the calendar for the specified date and uses Gemini AI to recommend 
@@ -171,10 +219,13 @@ def calculate_nap_time_tool(date_str: str, user_id: str = 'default_user',
         if days_diff > 7:
             return json.dumps({"error": f"Date is more than 7 days away. Please provide a date within the next week."})
         
-        # Fetch events from Node API for the target date
-        start_date = date_str
-        end_date = date_str
-        all_events = fetch_events_from_node_api(user_id, start_date, end_date)
+        # Require events from MongoDB via Node.js API
+        if not provided_events:
+            return json.dumps({"error": "Events must be provided from MongoDB via Node.js API. No fallback to JSON files."})
+        
+        # Events provided from MongoDB via Node.js API
+        all_events = provided_events
+        
         day_events = []
         for event in all_events:
             # Try to parse start time from normalized or raw fields
@@ -191,21 +242,30 @@ def calculate_nap_time_tool(date_str: str, user_id: str = 'default_user',
                     if event_dt.tzinfo:
                         event_dt = event_dt.astimezone().replace(tzinfo=None)
                     if event_dt.date() == target_date:
-                        # Parse end time
+                        # Parse end time - handle both MongoDB format and Google Calendar format
                         endISO = event.get('endISO')
-                        if not endISO and 'raw' in event:
-                            raw = event['raw']
-                            endISO = raw.get('end', {}).get('dateTime') or raw.get('end', {}).get('date')
+                        if not endISO:
+                            # Try Google Calendar format
+                            if isinstance(event.get('end'), dict):
+                                endISO = event.get('end', {}).get('dateTime') or event.get('end', {}).get('date')
+                            elif 'raw' in event:
+                                raw = event['raw']
+                                endISO = raw.get('end', {}).get('dateTime') if isinstance(raw.get('end'), dict) else raw.get('end')
+                        
                         if endISO:
-                            if endISO.endswith('Z'):
-                                endISO = endISO[:-1] + '+00:00'
-                            event_end = datetime.fromisoformat(endISO)
-                            if event_end.tzinfo:
-                                event_end = event_end.astimezone().replace(tzinfo=None)
+                            if isinstance(endISO, str):
+                                if endISO.endswith('Z'):
+                                    endISO = endISO[:-1] + '+00:00'
+                                event_end = datetime.fromisoformat(endISO)
+                                if event_end.tzinfo:
+                                    event_end = event_end.astimezone().replace(tzinfo=None)
+                            else:
+                                event_end = event_dt + timedelta(hours=1)
                         else:
                             event_end = event_dt + timedelta(hours=1)
+                        
                         day_events.append({
-                            'title': event.get('title', event.get('summary', 'Event')),
+                            'title': event.get('title') or event.get('summary', 'Event'),
                             'start': event_dt,
                             'end': event_end,
                             'description': event.get('description', '')
@@ -265,28 +325,7 @@ def calculate_nap_time_tool(date_str: str, user_id: str = 'default_user',
             free_slots_30.append((day_start, day_end))
             free_slots_90.append((day_start, day_end))
         
-        # Try to get free slots from calendar tool if available (optional)
-        try:
-            cal = get_calendar()
-            if cal:
-                tool_slots_30 = cal.find_free_slots(
-                    datetime.combine(target_date, datetime.min.time()),
-                    30
-                )
-                tool_slots_90 = cal.find_free_slots(
-                    datetime.combine(target_date, datetime.min.time()),
-                    90
-                )
-                # Merge with calculated slots (avoid duplicates)
-                for slot in tool_slots_30:
-                    if slot[0].date() == target_date and slot not in free_slots_30:
-                        free_slots_30.append(slot)
-                for slot in tool_slots_90:
-                    if slot[0].date() == target_date and slot not in free_slots_90:
-                        free_slots_90.append(slot)
-        except Exception:
-            # Calendar tool not available, use calculated slots
-            pass
+        # Free slots calculated from provided events only - no calendar tool fallback
         
         # Format free slots
         free_slots_text = "\n\n⏰ AVAILABLE FREE TIME SLOTS:\n\n"
@@ -394,14 +433,16 @@ Return EXACTLY 2 best nap recommendations total (can be mix of power nap and ful
         # Create Gemini client
         client = genai.Client()
         
-        # List of models to try
+        # List of models to try (prioritize models with available quota)
         models_to_try = [
-            'gemini-3-flash-preview',
-            'models/gemini-2.5-flash-lite',
-            'models/gemini-3-flash',
-            'models/gemma-3-12b-it',
-            'models/gemma-3-4b-it',
-            'models/gemini-2.5-flash',
+            'gemini-3-flash',  # 4/5 RPM available
+            'gemini-2.5-flash',  # Available, 0/5 RPM
+            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
+            'gemma-3-12b',  # Available, 0/30 RPM
+            'gemma-3-4b',  # Available, 0/30 RPM
+            'gemma-3-27b',  # Available, 0/30 RPM
+            'gemma-3-2b',  # Available, 0/30 RPM
+            'gemma-3-1b',  # Available, 0/30 RPM
         ]
         
         last_error = None
@@ -418,16 +459,37 @@ Return EXACTLY 2 best nap recommendations total (can be mix of power nap and ful
                 
             except Exception as e:
                 error_str = str(e)
-                # If it's a quota error, try next model
+                # If it's a quota error, wait a bit and retry once
                 if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+                    print(f"Model {model} quota exceeded, waiting 2 seconds and retrying...", flush=True)
+                    time.sleep(2)
+                    try:
+                        response = client.models.generate_content(
+                            model=model,
+                            contents=burnout_prompt,
+                        )
+                        gemini_response = response.text
+                        break
+                    except Exception as e2:
+                        last_error = e2
+                        print(f"Model {model} still failed after retry: {str(e2)[:200]}, trying next model...", flush=True)
+                        continue
+                # If it's a model not found error, try next model
+                elif '404' in error_str or 'NOT_FOUND' in error_str:
                     last_error = e
+                    print(f"Model {model} not found: {error_str[:200]}, trying next model...", flush=True)
                     continue
-                # If it's not a quota error, raise it immediately
+                # If it's not a recoverable error, raise it immediately
                 else:
                     raise
         
+        # If all SDK models failed, try REST API as fallback
         if not gemini_response:
-            raise Exception(f"All models exhausted. Last error: {last_error}")
+            print("All SDK models failed, trying REST API fallback...", flush=True)
+            gemini_response = _try_rest_api_fallback(api_key, burnout_prompt, last_error)
+        
+        if not gemini_response:
+            raise Exception(f"All models exhausted (SDK and REST API). Last error: {last_error}")
         
         # Parse Gemini's JSON response
         try:
@@ -518,7 +580,8 @@ Return EXACTLY 2 best nap recommendations total (can be mix of power nap and ful
 
 
 def calculate_meal_windows_tool(date_str: str, user_id: str = 'default_user', 
-                                sleep_time: str = '00:00', wake_time: str = '08:00') -> str:
+                                sleep_time: str = '00:00', wake_time: str = '08:00',
+                                provided_events: list = None) -> str:
     """Calculate optimal meal windows for a given day using Gemini AI
     
     Analyzes the calendar for the specified date and uses Gemini AI to recommend 
@@ -541,103 +604,68 @@ def calculate_meal_windows_tool(date_str: str, user_id: str = 'default_user',
         if days_diff > 7:
             return json.dumps({"error": f"Date is more than 7 days away. Please provide a date within the next week."})
         
-        # Get events from user_calendars.json
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        user_calendars_path = os.path.join(script_dir, 'user_data', f'{user_id}_calendars.json')
+        # Require events from MongoDB via Node.js API
+        if not provided_events:
+            return json.dumps({"error": "Events must be provided from MongoDB via Node.js API. No fallback to JSON files."})
         
+        # Events provided from MongoDB via Node.js API
+        all_events = provided_events
         day_events = []
-        if os.path.exists(user_calendars_path):
-            try:
-                with open(user_calendars_path, 'r') as f:
-                    calendar_data = json.load(f)
-                    all_events = calendar_data.get('events', [])
-                    
-                    # Filter events for the target date
-                    for event in all_events:
-                        start_data = event.get('start', {})
-                        if isinstance(start_data, dict):
-                            event_start_str = start_data.get('dateTime') or start_data.get('date')
-                        else:
-                            event_start_str = str(start_data)
-                        
-                        if event_start_str:
-                            try:
-                                # Handle timezone formats
-                                dt_str = event_start_str
-                                if dt_str.endswith('Z'):
-                                    dt_str = dt_str[:-1] + '+00:00'
-                                event_dt = datetime.fromisoformat(dt_str)
-                                if event_dt.tzinfo:
-                                    event_dt = event_dt.astimezone().replace(tzinfo=None)
-                                
-                                # Check if event is on target date
-                                if event_dt.date() == target_date:
-                                    end_data = event.get('end', {})
-                                    if isinstance(end_data, dict):
-                                        event_end_str = end_data.get('dateTime') or end_data.get('date')
-                                    else:
-                                        event_end_str = str(end_data) if end_data else None
-                                    
-                                    if event_end_str:
-                                        if event_end_str.endswith('Z'):
-                                            event_end_str = event_end_str[:-1] + '+00:00'
-                                        event_end = datetime.fromisoformat(event_end_str)
-                                        if event_end.tzinfo:
-                                            event_end = event_end.astimezone().replace(tzinfo=None)
-                                    else:
-                                        event_end = event_dt + timedelta(hours=1)
-                                    
-                                    day_events.append({
-                                        'title': event.get('summary', 'Event'),
-                                        'start': event_dt,
-                                        'end': event_end,
-                                        'description': event.get('description', '')
-                                    })
-                            except (ValueError, AttributeError):
-                                continue
-            except Exception as e:
-                print(f"Warning: Could not load calendar data: {e}", flush=True)
         
-        # If calendar tool is available, also try to get events from it
-        try:
-            cal = get_calendar()
-            if cal:
-                tool_events = cal.get_events(days_ahead=max(days_diff + 1, 1))
-                for event in tool_events:
-                    event_start = event.get('start', '')
-                    if isinstance(event_start, str):
-                        try:
-                            dt_str = event_start
-                            if dt_str.endswith('Z'):
-                                dt_str = dt_str[:-1] + '+00:00'
-                            event_dt = datetime.fromisoformat(dt_str)
-                            if event_dt.tzinfo:
-                                event_dt = event_dt.astimezone().replace(tzinfo=None)
-                            
-                            if event_dt.date() == target_date:
-                                # Check if we already have this event
-                                if not any(e['start'] == event_dt and e['title'] == event.get('title') for e in day_events):
-                                    event_end_str = event.get('end', '')
-                                    if isinstance(event_end_str, str):
-                                        if event_end_str.endswith('Z'):
-                                            event_end_str = event_end_str[:-1] + '+00:00'
-                                        event_end = datetime.fromisoformat(event_end_str)
-                                        if event_end.tzinfo:
-                                            event_end = event_end.astimezone().replace(tzinfo=None)
-                                    else:
-                                        event_end = event_dt + timedelta(hours=1)
-                                    
-                                    day_events.append({
-                                        'title': event.get('title', 'Event'),
-                                        'start': event_dt,
-                                        'end': event_end,
-                                        'description': event.get('description', '')
-                                    })
-                        except (ValueError, AttributeError):
-                            continue
-        except Exception:
-            # Calendar tool not available, that's okay - we have user_calendars.json
-            pass
+        # Filter events for the target date (works for both MongoDB and JSON formats)
+        for event in all_events:
+            # Handle both MongoDB format (startISO) and Google Calendar format (start.dateTime)
+            startISO = event.get('startISO')
+            if not startISO:
+                start_data = event.get('start', {})
+                if isinstance(start_data, dict):
+                    startISO = start_data.get('dateTime') or start_data.get('date')
+                else:
+                    startISO = str(start_data) if start_data else None
+            
+            if startISO:
+                try:
+                    # Handle timezone formats
+                    dt_str = startISO
+                    if dt_str.endswith('Z'):
+                        dt_str = dt_str[:-1] + '+00:00'
+                    event_dt = datetime.fromisoformat(dt_str)
+                    if event_dt.tzinfo:
+                        event_dt = event_dt.astimezone().replace(tzinfo=None)
+                    
+                    # Check if event is on target date
+                    if event_dt.date() == target_date:
+                        # Parse end time - handle both formats
+                        endISO = event.get('endISO')
+                        if not endISO:
+                            end_data = event.get('end', {})
+                            if isinstance(end_data, dict):
+                                endISO = end_data.get('dateTime') or end_data.get('date')
+                            else:
+                                endISO = str(end_data) if end_data else None
+                        
+                        if endISO:
+                            if isinstance(endISO, str):
+                                if endISO.endswith('Z'):
+                                    endISO = endISO[:-1] + '+00:00'
+                                event_end = datetime.fromisoformat(endISO)
+                                if event_end.tzinfo:
+                                    event_end = event_end.astimezone().replace(tzinfo=None)
+                            else:
+                                event_end = event_dt + timedelta(hours=1)
+                        else:
+                            event_end = event_dt + timedelta(hours=1)
+                        
+                        day_events.append({
+                            'title': event.get('title') or event.get('summary', 'Event'),
+                            'start': event_dt,
+                            'end': event_end,
+                            'description': event.get('description', '')
+                        })
+                except (ValueError, AttributeError):
+                    continue
+        
+        # Events must come from MongoDB via Node.js API - no calendar tool fallback
         
         # Sort events by start time
         day_events.sort(key=lambda x: x['start'])
@@ -655,6 +683,20 @@ def calculate_meal_windows_tool(date_str: str, user_id: str = 'default_user',
                     schedule_text += f"  Description: {desc}\n"
         else:
             schedule_text = f"\n\n📅 SCHEDULE FOR {target_date.strftime('%A, %B %d, %Y')}:\nNo events scheduled for this day.\n"
+        
+        # Parse sleep and wake times
+        try:
+            sleep_hour, sleep_minute = map(int, sleep_time.split(':'))
+            wake_hour, wake_minute = map(int, wake_time.split(':'))
+            sleep_time_obj = datetime.min.time().replace(hour=sleep_hour, minute=sleep_minute)
+            wake_time_obj = datetime.min.time().replace(hour=wake_hour, minute=wake_minute)
+        except (ValueError, AttributeError):
+            # Default to midnight and 8 AM if parsing fails
+            sleep_time_obj = datetime.min.time().replace(hour=0, minute=0)
+            wake_time_obj = datetime.min.time().replace(hour=8, minute=0)
+        
+        sleep_time_str = sleep_time_obj.strftime('%I:%M %p')
+        wake_time_str = wake_time_obj.strftime('%I:%M %p')
         
         # Calculate meal timing windows based on wake/sleep times
         wake_dt = datetime.combine(target_date, wake_time_obj)
@@ -750,14 +792,16 @@ Return meal recommendations for breakfast, lunch, and dinner (and snacks only if
         # Create Gemini client
         client = genai.Client()
         
-        # List of models to try
+        # List of models to try (prioritize models with available quota)
         models_to_try = [
-            'gemini-3-flash-preview',
-            'models/gemini-2.5-flash-lite',
-            'models/gemini-3-flash',
-            'models/gemma-3-12b-it',
-            'models/gemma-3-4b-it',
-            'models/gemini-2.5-flash',
+            'gemini-3-flash',  # 4/5 RPM available
+            'gemini-2.5-flash',  # Available, 0/5 RPM
+            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
+            'gemma-3-12b',  # Available, 0/30 RPM
+            'gemma-3-4b',  # Available, 0/30 RPM
+            'gemma-3-27b',  # Available, 0/30 RPM
+            'gemma-3-2b',  # Available, 0/30 RPM
+            'gemma-3-1b',  # Available, 0/30 RPM
         ]
         
         last_error = None
@@ -774,16 +818,37 @@ Return meal recommendations for breakfast, lunch, and dinner (and snacks only if
                 
             except Exception as e:
                 error_str = str(e)
-                # If it's a quota error, try next model
+                # If it's a quota error, wait a bit and retry once
                 if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+                    print(f"Model {model} quota exceeded, waiting 2 seconds and retrying...", flush=True)
+                    time.sleep(2)
+                    try:
+                        response = client.models.generate_content(
+                            model=model,
+                            contents=burnout_prompt,
+                        )
+                        gemini_response = response.text
+                        break
+                    except Exception as e2:
+                        last_error = e2
+                        print(f"Model {model} still failed after retry: {str(e2)[:200]}, trying next model...", flush=True)
+                        continue
+                # If it's a model not found error, try next model
+                elif '404' in error_str or 'NOT_FOUND' in error_str:
                     last_error = e
+                    print(f"Model {model} not found: {error_str[:200]}, trying next model...", flush=True)
                     continue
-                # If it's not a quota error, raise it immediately
+                # If it's not a recoverable error, raise it immediately
                 else:
                     raise
         
+        # If all SDK models failed, try REST API as fallback
         if not gemini_response:
-            raise Exception(f"All models exhausted. Last error: {last_error}")
+            print("All SDK models failed, trying REST API fallback...", flush=True)
+            gemini_response = _try_rest_api_fallback(api_key, burnout_prompt, last_error)
+        
+        if not gemini_response:
+            raise Exception(f"All models exhausted (SDK and REST API). Last error: {last_error}")
         
         # Parse Gemini's JSON response
         try:
@@ -871,7 +936,8 @@ Return meal recommendations for breakfast, lunch, and dinner (and snacks only if
 
 
 def predict_burnout_tool(date_str: str, user_id: str = 'default_user', 
-                         sleep_time: str = '00:00', wake_time: str = '08:00') -> str:
+                         sleep_time: str = '00:00', wake_time: str = '08:00',
+                         provided_events: list = None) -> str:
     """Predict burnout score for a given date using Gemini AI
     
     Analyzes the calendar schedule for the specified date and uses Gemini AI to predict
@@ -894,77 +960,78 @@ def predict_burnout_tool(date_str: str, user_id: str = 'default_user',
         if days_diff > 7:
             return json.dumps({"error": f"Date is more than 7 days away. Please provide a date within the next week."})
         
-        # Get events from user_calendars.json
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        user_calendars_path = os.path.join(script_dir, 'user_data', f'{user_id}_calendars.json')
+        # Require events from MongoDB via Node.js API
+        if not provided_events:
+            return json.dumps({"error": "Events must be provided from MongoDB via Node.js API. No fallback to JSON files."})
         
-        # Get events for target date and surrounding days (for context)
+        # Events provided from MongoDB via Node.js API
+        all_events = provided_events
         day_events = []
         week_events = []
         
-        if os.path.exists(user_calendars_path):
-            try:
-                with open(user_calendars_path, 'r') as f:
-                    calendar_data = json.load(f)
-                    all_events = calendar_data.get('events', [])
+        # Process events (works for both MongoDB and JSON formats)
+        for event in all_events:
+            # Handle both MongoDB format (startISO) and Google Calendar format (start.dateTime)
+            startISO = event.get('startISO')
+            if not startISO:
+                start_data = event.get('start', {})
+                if isinstance(start_data, dict):
+                    startISO = start_data.get('dateTime') or start_data.get('date')
+                else:
+                    startISO = str(start_data) if start_data else None
+            
+            if startISO:
+                try:
+                    dt_str = startISO
+                    if dt_str.endswith('Z'):
+                        dt_str = dt_str[:-1] + '+00:00'
+                    event_dt = datetime.fromisoformat(dt_str)
+                    if event_dt.tzinfo:
+                        event_dt = event_dt.astimezone().replace(tzinfo=None)
                     
-                    # Get events for target date and 3 days before/after for context
-                    for event in all_events:
-                        start_data = event.get('start', {})
-                        if isinstance(start_data, dict):
-                            event_start_str = start_data.get('dateTime') or start_data.get('date')
+                    event_date = event_dt.date()
+                    
+                    # Calculate end time for all events
+                    endISO = event.get('endISO')
+                    if not endISO:
+                        end_data = event.get('end', {})
+                        if isinstance(end_data, dict):
+                            endISO = end_data.get('dateTime') or end_data.get('date')
                         else:
-                            event_start_str = str(start_data)
-                        
-                        if event_start_str:
-                            try:
-                                dt_str = event_start_str
-                                if dt_str.endswith('Z'):
-                                    dt_str = dt_str[:-1] + '+00:00'
-                                event_dt = datetime.fromisoformat(dt_str)
-                                if event_dt.tzinfo:
-                                    event_dt = event_dt.astimezone().replace(tzinfo=None)
-                                
-                                event_date = event_dt.date()
-                                
-                                # Calculate end time for all events
-                                end_data = event.get('end', {})
-                                if isinstance(end_data, dict):
-                                    event_end_str = end_data.get('dateTime') or end_data.get('date')
-                                else:
-                                    event_end_str = str(end_data) if end_data else None
-                                
-                                if event_end_str:
-                                    if event_end_str.endswith('Z'):
-                                        event_end_str = event_end_str[:-1] + '+00:00'
-                                    event_end = datetime.fromisoformat(event_end_str)
-                                    if event_end.tzinfo:
-                                        event_end = event_end.astimezone().replace(tzinfo=None)
-                                else:
-                                    event_end = event_dt + timedelta(hours=1)
-                                
-                                # Check if event is on target date
-                                if event_date == target_date:
-                                    day_events.append({
-                                        'title': event.get('summary', 'Event'),
-                                        'start': event_dt,
-                                        'end': event_end,
-                                        'description': event.get('description', '')
-                                    })
-                                
-                                # Also collect events from 3 days before to 3 days after for context
-                                days_from_target = (event_date - target_date).days
-                                if -3 <= days_from_target <= 3:
-                                    week_events.append({
-                                        'title': event.get('summary', 'Event'),
-                                        'date': event_date,
-                                        'start': event_dt,
-                                        'end': event_end
-                                    })
-                            except (ValueError, AttributeError):
-                                continue
-            except Exception as e:
-                print(f"Warning: Could not load calendar data: {e}", flush=True)
+                            endISO = str(end_data) if end_data else None
+                    
+                    if endISO:
+                        if isinstance(endISO, str):
+                            if endISO.endswith('Z'):
+                                endISO = endISO[:-1] + '+00:00'
+                            event_end = datetime.fromisoformat(endISO)
+                            if event_end.tzinfo:
+                                event_end = event_end.astimezone().replace(tzinfo=None)
+                        else:
+                            event_end = event_dt + timedelta(hours=1)
+                    else:
+                        event_end = event_dt + timedelta(hours=1)
+                    
+                    # Check if event is on target date
+                    if event_date == target_date:
+                        day_events.append({
+                            'title': event.get('title') or event.get('summary', 'Event'),
+                            'start': event_dt,
+                            'end': event_end,
+                            'description': event.get('description', '')
+                        })
+                    
+                    # Also collect events from 3 days before to 3 days after for context
+                    days_from_target = (event_date - target_date).days
+                    if -3 <= days_from_target <= 3:
+                        week_events.append({
+                            'title': event.get('title') or event.get('summary', 'Event'),
+                            'date': event_date,
+                            'start': event_dt,
+                            'end': event_end
+                        })
+                except (ValueError, AttributeError):
+                    continue
         
         # Sort events by start time
         day_events.sort(key=lambda x: x['start'])
@@ -1095,14 +1162,16 @@ Be specific and evidence-based in your analysis. Consider schedule density, slee
         # Create Gemini client
         client = genai.Client()
         
-        # List of models to try
+        # List of models to try (prioritize models with available quota)
         models_to_try = [
-            'gemini-3-flash-preview',
-            'models/gemini-2.5-flash-lite',
-            'models/gemini-3-flash',
-            'models/gemma-3-12b-it',
-            'models/gemma-3-4b-it',
-            'models/gemini-2.5-flash',
+            'gemini-3-flash',  # 4/5 RPM available
+            'gemini-2.5-flash',  # Available, 0/5 RPM
+            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
+            'gemma-3-12b',  # Available, 0/30 RPM
+            'gemma-3-4b',  # Available, 0/30 RPM
+            'gemma-3-27b',  # Available, 0/30 RPM
+            'gemma-3-2b',  # Available, 0/30 RPM
+            'gemma-3-1b',  # Available, 0/30 RPM
         ]
         
         last_error = None
@@ -1119,16 +1188,37 @@ Be specific and evidence-based in your analysis. Consider schedule density, slee
                 
             except Exception as e:
                 error_str = str(e)
-                # If it's a quota error, try next model
+                # If it's a quota error, wait a bit and retry once
                 if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+                    print(f"Model {model} quota exceeded, waiting 2 seconds and retrying...", flush=True)
+                    time.sleep(2)
+                    try:
+                        response = client.models.generate_content(
+                            model=model,
+                            contents=burnout_prompt,
+                        )
+                        gemini_response = response.text
+                        break
+                    except Exception as e2:
+                        last_error = e2
+                        print(f"Model {model} still failed after retry: {str(e2)[:200]}, trying next model...", flush=True)
+                        continue
+                # If it's a model not found error, try next model
+                elif '404' in error_str or 'NOT_FOUND' in error_str:
                     last_error = e
+                    print(f"Model {model} not found: {error_str[:200]}, trying next model...", flush=True)
                     continue
-                # If it's not a quota error, raise it immediately
+                # If it's not a recoverable error, raise it immediately
                 else:
                     raise
         
+        # If all SDK models failed, try REST API as fallback
         if not gemini_response:
-            raise Exception(f"All models exhausted. Last error: {last_error}")
+            print("All SDK models failed, trying REST API fallback...", flush=True)
+            gemini_response = _try_rest_api_fallback(api_key, burnout_prompt, last_error)
+        
+        if not gemini_response:
+            raise Exception(f"All models exhausted (SDK and REST API). Last error: {last_error}")
         
         # Parse Gemini's JSON response
         try:
@@ -1188,7 +1278,7 @@ Be specific and evidence-based in your analysis. Consider schedule density, slee
 
 def predict_burnout_batch_tool(user_id: str = 'default_user', 
                                sleep_time: str = '00:00', wake_time: str = '08:00',
-                               days_ahead: int = 14) -> str:
+                               days_ahead: int = 14, provided_events: list = None) -> str:
     """Predict burnout scores for the next N days using Gemini AI (batch processing)
     
     Analyzes calendar schedules for multiple days and uses Gemini AI to predict
@@ -1214,56 +1304,65 @@ def predict_burnout_batch_tool(user_id: str = 'default_user',
             date_range.append(target_date)
             events_by_date[target_date] = []
         
-        if os.path.exists(user_calendars_path):
-            try:
-                with open(user_calendars_path, 'r') as f:
-                    calendar_data = json.load(f)
-                    all_events = calendar_data.get('events', [])
+        # Require events from MongoDB via Node.js API
+        if not provided_events:
+            return json.dumps({"error": "Events must be provided from MongoDB via Node.js API. No fallback to JSON files."})
+        
+        # Events provided from MongoDB via Node.js API
+        all_events = provided_events
+        
+        # Process events (works for both MongoDB and JSON formats)
+        for event in all_events:
+            # Handle both MongoDB format (startISO) and Google Calendar format (start.dateTime)
+            startISO = event.get('startISO')
+            if not startISO:
+                start_data = event.get('start', {})
+                if isinstance(start_data, dict):
+                    startISO = start_data.get('dateTime') or start_data.get('date')
+                else:
+                    startISO = str(start_data) if start_data else None
+            
+            if startISO:
+                try:
+                    dt_str = startISO
+                    if dt_str.endswith('Z'):
+                        dt_str = dt_str[:-1] + '+00:00'
+                    event_dt = datetime.fromisoformat(dt_str)
+                    if event_dt.tzinfo:
+                        event_dt = event_dt.astimezone().replace(tzinfo=None)
                     
-                    for event in all_events:
-                        start_data = event.get('start', {})
-                        if isinstance(start_data, dict):
-                            event_start_str = start_data.get('dateTime') or start_data.get('date')
-                        else:
-                            event_start_str = str(start_data)
+                    event_date = event_dt.date()
+                    
+                    if event_date in events_by_date:
+                        # Parse end time
+                        endISO = event.get('endISO')
+                        if not endISO:
+                            end_data = event.get('end', {})
+                            if isinstance(end_data, dict):
+                                endISO = end_data.get('dateTime') or end_data.get('date')
+                            else:
+                                endISO = str(end_data) if end_data else None
                         
-                        if event_start_str:
-                            try:
-                                dt_str = event_start_str
-                                if dt_str.endswith('Z'):
-                                    dt_str = dt_str[:-1] + '+00:00'
-                                event_dt = datetime.fromisoformat(dt_str)
-                                if event_dt.tzinfo:
-                                    event_dt = event_dt.astimezone().replace(tzinfo=None)
-                                
-                                event_date = event_dt.date()
-                                
-                                if event_date in events_by_date:
-                                    end_data = event.get('end', {})
-                                    if isinstance(end_data, dict):
-                                        event_end_str = end_data.get('dateTime') or end_data.get('date')
-                                    else:
-                                        event_end_str = str(end_data) if end_data else None
-                                    
-                                    if event_end_str:
-                                        if event_end_str.endswith('Z'):
-                                            event_end_str = event_end_str[:-1] + '+00:00'
-                                        event_end = datetime.fromisoformat(event_end_str)
-                                        if event_end.tzinfo:
-                                            event_end = event_end.astimezone().replace(tzinfo=None)
-                                    else:
-                                        event_end = event_dt + timedelta(hours=1)
-                                    
-                                    events_by_date[event_date].append({
-                                        'title': event.get('summary', 'Event'),
-                                        'start': event_dt,
-                                        'end': event_end,
-                                        'description': event.get('description', '')
-                                    })
-                            except (ValueError, AttributeError):
-                                continue
-            except Exception as e:
-                print(f"Warning: Could not load calendar data: {e}", flush=True)
+                        if endISO:
+                            if isinstance(endISO, str):
+                                if endISO.endswith('Z'):
+                                    endISO = endISO[:-1] + '+00:00'
+                                event_end = datetime.fromisoformat(endISO)
+                                if event_end.tzinfo:
+                                    event_end = event_end.astimezone().replace(tzinfo=None)
+                            else:
+                                event_end = event_dt + timedelta(hours=1)
+                        else:
+                            event_end = event_dt + timedelta(hours=1)
+                        
+                        events_by_date[event_date].append({
+                            'title': event.get('title') or event.get('summary', 'Event'),
+                            'start': event_dt,
+                            'end': event_end,
+                            'description': event.get('description', '')
+                        })
+                except (ValueError, AttributeError):
+                    continue
         
         # Load previous burnout scores from cache for historical context
         previous_cache = load_burnout_cache(user_id=user_id)
@@ -1423,14 +1522,16 @@ Return predictions for ALL {days_ahead} days in chronological order. Each day's 
         # Create Gemini client
         client = genai.Client()
         
-        # List of models to try
+        # List of models to try (prioritize models with available quota)
         models_to_try = [
-            'gemini-3-flash-preview',
-            'models/gemini-2.5-flash-lite',
-            'models/gemini-3-flash',
-            'models/gemma-3-12b-it',
-            'models/gemma-3-4b-it',
-            'models/gemini-2.5-flash',
+            'gemini-3-flash',  # 4/5 RPM available
+            'gemini-2.5-flash',  # Available, 0/5 RPM
+            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
+            'gemma-3-12b',  # Available, 0/30 RPM
+            'gemma-3-4b',  # Available, 0/30 RPM
+            'gemma-3-27b',  # Available, 0/30 RPM
+            'gemma-3-2b',  # Available, 0/30 RPM
+            'gemma-3-1b',  # Available, 0/30 RPM
         ]
         
         last_error = None
@@ -1447,16 +1548,37 @@ Return predictions for ALL {days_ahead} days in chronological order. Each day's 
                 
             except Exception as e:
                 error_str = str(e)
-                # If it's a quota error, try next model
+                # If it's a quota error, wait a bit and retry once
                 if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+                    print(f"Model {model} quota exceeded, waiting 2 seconds and retrying...", flush=True)
+                    time.sleep(2)
+                    try:
+                        response = client.models.generate_content(
+                            model=model,
+                            contents=burnout_prompt,
+                        )
+                        gemini_response = response.text
+                        break
+                    except Exception as e2:
+                        last_error = e2
+                        print(f"Model {model} still failed after retry: {str(e2)[:200]}, trying next model...", flush=True)
+                        continue
+                # If it's a model not found error, try next model
+                elif '404' in error_str or 'NOT_FOUND' in error_str:
                     last_error = e
+                    print(f"Model {model} not found: {error_str[:200]}, trying next model...", flush=True)
                     continue
-                # If it's not a quota error, raise it immediately
+                # If it's not a recoverable error, raise it immediately
                 else:
                     raise
         
+        # If all SDK models failed, try REST API as fallback
         if not gemini_response:
-            raise Exception(f"All models exhausted. Last error: {last_error}")
+            print("All SDK models failed, trying REST API fallback...", flush=True)
+            gemini_response = _try_rest_api_fallback(api_key, burnout_prompt, last_error)
+        
+        if not gemini_response:
+            raise Exception(f"All models exhausted (SDK and REST API). Last error: {last_error}")
         
         # Parse Gemini's JSON response
         try:
@@ -1775,12 +1897,11 @@ def run_query(query: str, user_id: str = 'default_user', days_back: int = 10) ->
 
     # List of models to try in order (prioritize those with quota available)
     models_to_try = [
-        'gemini-3-flash-preview',        # User's preferred model
-        'models/gemini-2.5-flash-lite',  # 0/10 requests available
-        'models/gemini-3-flash',         # 0/5 requests available
-        'models/gemma-3-12b-it',         # 0/30 requests available
-        'models/gemma-3-4b-it',          # 0/30 requests available
-        'models/gemini-2.5-flash',        # 6/5 (over quota but try anyway)
+        'gemini-3-flash',          # 4/5 RPM available
+        'gemini-2.5-flash',        # Available
+        'gemini-2.5-flash-lite',  # Available
+        'gemma-3-12b',            # Available
+        'gemma-3-4b',             # Available
     ]
 
     last_error = None
