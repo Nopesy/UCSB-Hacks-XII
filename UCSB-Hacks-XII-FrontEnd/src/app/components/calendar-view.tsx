@@ -1,6 +1,8 @@
 import { ChevronLeft, ChevronRight } from 'lucide-react';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { CalendarSync } from './calendar-sync';
+
+const API_BASE_URL = 'http://localhost:5001';
 
 interface CalendarEvent {
   time: string;
@@ -188,6 +190,148 @@ export function CalendarView() {
   const weekDays = generateWeekDays(refDateForWeek);
 
   const selectedDateObj = selectedDay ? new Date(selectedDay.year!, selectedDay.month!, selectedDay.date) : null;
+
+  const [loadingNapTimes, setLoadingNapTimes] = useState(false);
+  const [napEvents, setNapEvents] = useState<any[]>([]);
+  const [napError, setNapError] = useState<string | null>(null);
+
+  const [loadingMealTimes, setLoadingMealTimes] = useState(false);
+  const [mealEvents, setMealEvents] = useState<any[]>([]);
+  const [mealError, setMealError] = useState<string | null>(null);
+
+  const [loadingBurnout, setLoadingBurnout] = useState(false);
+  const [burnoutScore, setBurnoutScore] = useState<number | null>(null);
+  const [burnoutStatus, setBurnoutStatus] = useState<string | null>(null);
+  const [burnoutError, setBurnoutError] = useState<string | null>(null);
+
+  const handlePredictBurnout = async (date: string) => {
+    setLoadingBurnout(true);
+    setBurnoutError(null);
+    setBurnoutScore(null);
+    setBurnoutStatus(null);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/burnout/predict`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          date: date,
+          user_id: 'default_user',
+          // Using default sleep_time: '00:00' and wake_time: '08:00'
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.success) {
+        setBurnoutScore(data.score);
+        setBurnoutStatus(data.status);
+      } else {
+        setBurnoutError(data.error || 'Failed to predict burnout');
+      }
+    } catch (error) {
+      console.error('Error predicting burnout:', error);
+      setBurnoutError('Failed to connect to API. Make sure the server is running on http://localhost:5001');
+    } finally {
+      setLoadingBurnout(false);
+    }
+  };
+
+  const handleGetNapTimes = async () => {
+    if (!selectedDate) {
+      setNapError('Please select a date first');
+      return;
+    }
+
+    setLoadingNapTimes(true);
+    setNapError(null);
+    setNapEvents([]);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/nap-times/calculate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          date: selectedDate,
+          user_id: 'default_user',
+          // Using default sleep_time: '00:00' and wake_time: '08:00'
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.success) {
+        setNapEvents(data.events || []);
+        if (data.events.length === 0) {
+          setNapError('No nap recommendations available for this date');
+        }
+      } else {
+        setNapError(data.error || 'Failed to calculate nap times');
+      }
+    } catch (error) {
+      console.error('Error fetching nap times:', error);
+      setNapError('Failed to connect to API. Make sure the server is running on http://localhost:5001');
+    } finally {
+      setLoadingNapTimes(false);
+    }
+  };
+
+  const handleGetMealTimes = async () => {
+    if (!selectedDate) {
+      setMealError('Please select a date first');
+      return;
+    }
+
+    setLoadingMealTimes(true);
+    setMealError(null);
+    setMealEvents([]);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/meal-windows/calculate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          date: selectedDate,
+          user_id: 'default_user',
+          // Using default sleep_time: '00:00' and wake_time: '08:00'
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.success) {
+        setMealEvents(data.events || []);
+        if (data.events.length === 0) {
+          setMealError('No meal recommendations available for this date');
+        }
+      } else {
+        setMealError(data.error || 'Failed to calculate meal windows');
+      }
+    } catch (error) {
+      console.error('Error fetching meal windows:', error);
+      setMealError('Failed to connect to API. Make sure the server is running on http://localhost:5001');
+    } finally {
+      setLoadingMealTimes(false);
+    }
+  };
+
+  // Automatically predict burnout when a date is selected
+  useEffect(() => {
+    if (selectedDate) {
+      handlePredictBurnout(selectedDate);
+    } else {
+      setBurnoutScore(null);
+      setBurnoutStatus(null);
+      setBurnoutError(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDate]);
 
   return (
     <div className="space-y-6">
@@ -415,10 +559,142 @@ export function CalendarView() {
         </div>
 
         <div className="mt-6 pt-6 border-t border-border/50">
-          <div className="flex items-center justify-between text-sm">
+          <div className="flex items-center justify-between text-sm mb-4">
             <span className="text-muted-foreground">Predicted burnout</span>
-            <span className="font-semibold text-[#fb7185]">71/100</span>
+            {loadingBurnout ? (
+              <span className="text-muted-foreground text-xs">Calculating...</span>
+            ) : burnoutError ? (
+              <span className="text-destructive text-xs">Error</span>
+            ) : burnoutScore !== null ? (
+              <span 
+                className="font-semibold"
+                style={{ 
+                  color: burnoutStatus === 'stable' ? '#10b981' :
+                         burnoutStatus === 'building' ? '#f59e0b' :
+                         burnoutStatus === 'high-risk' ? '#fb7185' :
+                         burnoutStatus === 'critical' ? '#dc2626' : '#fb7185'
+                }}
+              >
+                {burnoutScore}/100
+              </span>
+            ) : (
+              <span className="text-muted-foreground text-xs">Select a date</span>
+            )}
           </div>
+          {burnoutError && (
+            <div className="mb-4 p-2 bg-destructive/10 border border-destructive/20 rounded-lg">
+              <p className="text-xs text-destructive">{burnoutError}</p>
+            </div>
+          )}
+
+          {/* Nap Times Button */}
+          <button
+            onClick={handleGetNapTimes}
+            disabled={loadingNapTimes || !selectedDate}
+            className="w-full bg-primary text-primary-foreground py-3 px-4 rounded-xl hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed font-medium mb-3"
+          >
+            {loadingNapTimes ? 'Loading Nap Recommendations...' : 'Get Nap Time Recommendations'}
+          </button>
+
+          {/* Meal Times Button */}
+          <button
+            onClick={handleGetMealTimes}
+            disabled={loadingMealTimes || !selectedDate}
+            className="w-full bg-primary text-primary-foreground py-3 px-4 rounded-xl hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+          >
+            {loadingMealTimes ? 'Loading Meal Recommendations...' : 'Get Meal Time Recommendations'}
+          </button>
+
+          {/* Nap Times Results */}
+          {napError && (
+            <div className="mt-4 p-3 bg-destructive/10 border border-destructive/20 rounded-lg">
+              <p className="text-sm text-destructive">{napError}</p>
+            </div>
+          )}
+
+          {napEvents.length > 0 && (
+            <div className="mt-4 space-y-2">
+              <h4 className="text-sm font-semibold text-foreground mb-2">Suggested Nap Times:</h4>
+              {napEvents.map((event, index) => {
+                const startTime = new Date(event.start.dateTime).toLocaleTimeString('en-US', {
+                  hour: 'numeric',
+                  minute: '2-digit',
+                  hour12: true
+                });
+                const endTime = new Date(event.end.dateTime).toLocaleTimeString('en-US', {
+                  hour: 'numeric',
+                  minute: '2-digit',
+                  hour12: true
+                });
+                return (
+                  <div
+                    key={index}
+                    className="p-3 bg-muted/30 rounded-lg border-l-4 border-blue-500"
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <p className="text-sm font-medium text-foreground">{event.summary}</p>
+                      <span className="text-xs text-muted-foreground">{event.duration_minutes} min</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground mb-1">
+                      {startTime} - {endTime}
+                    </p>
+                    {event.description && (
+                      <p className="text-xs text-muted-foreground/80 mt-1">{event.description}</p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Meal Times Results */}
+          {mealError && (
+            <div className="mt-4 p-3 bg-destructive/10 border border-destructive/20 rounded-lg">
+              <p className="text-sm text-destructive">{mealError}</p>
+            </div>
+          )}
+
+          {mealEvents.length > 0 && (
+            <div className="mt-4 space-y-2">
+              <h4 className="text-sm font-semibold text-foreground mb-2">Suggested Meal Times:</h4>
+              {mealEvents.map((event, index) => {
+                const startTime = new Date(event.start.dateTime).toLocaleTimeString('en-US', {
+                  hour: 'numeric',
+                  minute: '2-digit',
+                  hour12: true
+                });
+                const endTime = new Date(event.end.dateTime).toLocaleTimeString('en-US', {
+                  hour: 'numeric',
+                  minute: '2-digit',
+                  hour12: true
+                });
+                const mealTypeColors: Record<string, string> = {
+                  breakfast: 'border-yellow-500',
+                  lunch: 'border-orange-500',
+                  dinner: 'border-red-500',
+                  snack: 'border-purple-500'
+                };
+                const borderColor = mealTypeColors[event.meal_type] || 'border-gray-500';
+                return (
+                  <div
+                    key={index}
+                    className={`p-3 bg-muted/30 rounded-lg border-l-4 ${borderColor}`}
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <p className="text-sm font-medium text-foreground">{event.summary}</p>
+                      <span className="text-xs text-muted-foreground">{event.duration_minutes} min</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground mb-1">
+                      {startTime} - {endTime}
+                    </p>
+                    {event.description && (
+                      <p className="text-xs text-muted-foreground/80 mt-1">{event.description}</p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
       </div>
