@@ -33,9 +33,13 @@ pip install -r ../requirements.txt
 
 3. Set up environment variables:
 ```bash
-# Create .env file in project root
-GEMINI_API_KEY=your_gemini_api_key_here
+# Set your Gemini API key (supports both variable names)
+export GOOGLE_API_KEY=your_gemini_api_key_here
+# OR (for backward compatibility)
+export GEMINI_API_KEY=your_gemini_api_key_here
 ```
+
+Get your API key from: https://aistudio.google.com/app/apikey
 
 4. Run OAuth setup (one-time):
 ```bash
@@ -72,6 +76,7 @@ API runs on `http://localhost:5001`
 - `POST /api/calendars/list` - List user's calendars
 - `POST /api/calendars/sync` - Sync selected calendars and fetch events
 - `POST /api/auth/status` - Check authentication status
+- `POST /api/gemini/chat` - Chat with Gemini AI (accepts natural language queries)
 
 ## File Structure
 
