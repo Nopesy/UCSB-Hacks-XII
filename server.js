@@ -1,52 +1,29 @@
-// GET /api/sleep/:date?user_id=... - fetch sleep entry for a specific date and user
-app.get("/api/sleep/:date", async (req, res) => {
-  const { date } = req.params;
-  const userId = req.query.user_id || DEMO_USER_ID;
-  if (!date) {
-    return res.status(400).json({ message: "date param required (YYYY-MM-DD)" });
-  }
-  const entry = await SleepEntry.findOne({
-    userId,
-    dateKey: date,
-  }).lean();
-  if (!entry) {
-    return res.status(404).json({ message: "No sleep entry for this date" });
-  }
-  res.json({
-    sleepTime: entry.sleepTime,
-    wakeTime: entry.wakeTime,
-    dateKey: entry.dateKey,
-  });
-});
-import express from "express"
-import cors from "cors"
-import dotenv from "dotenv"
-import mongoose from "mongoose"
 
-import SleepEntry from "./models/SleepEntry.js"
-import CalendarEvent from "./models/CalendarEvent.js"
-import EventRating from "./models/EventRating.js"
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import mongoose from "mongoose";
 
+import SleepEntry from "./models/SleepEntry.js";
+import CalendarEvent from "./models/CalendarEvent.js";
+import EventRating from "./models/EventRating.js";
 
-dotenv.config() //loads .env file contents into process.env
+dotenv.config(); // loads .env file contents into process.env
 
-const app = express() //creates api server 
-app.use(cors())//alows requests from localhost:5173 (frontend)
+const app = express(); // creates api server
+app.use(cors()); // allows requests from localhost:5173 (frontend)
 // Increase body parsing limits to accept large calendar sync payloads
-app.use(express.json({ limit: '20mb' })) //lets us read large json in request body
-app.use(express.urlencoded({ limit: '20mb', extended: true }))
+app.use(express.json({ limit: '20mb' })); // lets us read large json in request body
+app.use(express.urlencoded({ limit: '20mb', extended: true }));
 
 // connects to Mongo
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => console.log("✅ Connected to MongoDB Atlas"))
   .catch((err) => {
-    console.error("❌ MongoDB connection error:", err)
-    process.exit(1)
-  })
-
-// checks if server is running
-app.get("/api/health", (req, res) => res.json({ ok: true }))
+    console.error("❌ MongoDB connection error:", err);
+    process.exit(1);
+  });
 
 const port = process.env.PORT || 3001
 app.listen(port, () => console.log(`🚀 API running on http://localhost:${port}`))

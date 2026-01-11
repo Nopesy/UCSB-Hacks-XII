@@ -653,22 +653,60 @@ export function CalendarView() {
         <div className="flex items-center justify-between mb-6">
           <div>
             <h3 className="text-lg font-semibold text-foreground">
-              {selectedDateObj ? (
-                `${selectedDateObj.toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' })}${selectedSlot && selectedSlot.iso === selectedDay?.iso ? ` — ${formatHour(selectedSlot.hour)}` : ''}`
-              ) : `${monthNames[viewMonth]} ${viewYear}`}
+              {viewMode === 'week' && selectedSlot && selectedSlot.eventId
+                ? (() => {
+                    const event = weekDays
+                      .flatMap(day => day.events)
+                      .find(e => e._id === selectedSlot.eventId);
+                    if (!event) return `${monthNames[viewMonth]} ${viewYear}`;
+                    const eventDateObj = new Date(event.startTs);
+                    return eventDateObj.toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+                  })()
+                : selectedDateObj
+                ? `${selectedDateObj.toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' })}${selectedSlot && selectedSlot.iso === selectedDay?.iso ? ` — ${formatHour(selectedSlot.hour)}` : ''}`
+                : `${monthNames[viewMonth]} ${viewYear}`}
             </h3>
-            <p className="text-sm text-muted-foreground mt-1">{selectedDateObj ? (selectedSlot && selectedSlot.iso === selectedDay?.iso ? `Selected time: ${formatHour(selectedSlot.hour)}` : "Selected day's schedule") : 'Pick a day to see details'}</p>
+            <p className="text-sm text-muted-foreground mt-1">
+              {viewMode === 'week' && selectedSlot && selectedSlot.eventId
+                ? (() => {
+                    const event = weekDays
+                      .flatMap(day => day.events)
+                      .find(e => e._id === selectedSlot.eventId);
+                    if (!event) return '';
+                    return `Selected time: ${formatHour(new Date(event.startTs).getHours())}`;
+                  })()
+                : selectedDateObj
+                ? (selectedSlot && selectedSlot.iso === selectedDay?.iso ? `Selected time: ${formatHour(selectedSlot.hour)}` : "Selected day's schedule")
+                : 'Pick a day to see details'}
+            </p>
           </div>
           <div
             className="w-3 h-3 rounded-full"
-            style={{ backgroundColor: selectedDay?.stressLevel ? getStressColor(selectedDay.stressLevel) : 'transparent' }}
+            style={{
+              backgroundColor:
+                viewMode === 'week' && selectedSlot && selectedSlot.eventId
+                  ? (() => {
+                      const event = weekDays
+                        .flatMap(day => day.events)
+                        .find(e => e._id === selectedSlot.eventId);
+                      return event?.type === 'exam'
+                        ? getStressColor('high-risk')
+                        : event?.type === 'assignment'
+                        ? getStressColor('building')
+                        : getStressColor(selectedDay?.stressLevel);
+                    })()
+                  : selectedDay?.stressLevel
+                  ? getStressColor(selectedDay.stressLevel)
+                  : 'transparent',
+            }}
           />
         </div>
 
         <div className="space-y-3">
-          {/* Show selected event details if an event is selected in week view */}
-          {selectedSlot && selectedSlot.eventId
-            ? (() => {
+          {/* In week view, show only the clicked event's info and correct day title */}
+          {viewMode === 'week' ? (
+            selectedSlot && selectedSlot.eventId ? (
+              (() => {
                 const event = weekDays
                   .flatMap(day => day.events)
                   .find(e => e._id === selectedSlot.eventId);
@@ -693,26 +731,55 @@ export function CalendarView() {
                   </div>
                 );
               })()
-            : selectedDay?.events.map((event, index) => (
-                <div
-                  key={index}
-                  className="p-4 bg-muted/30 rounded-xl border-l-4"
-                  style={{
-                    borderColor:
-                      event.type === 'exam'
-                        ? 'var(--status-high-risk)'
-                        : event.type === 'assignment'
-                        ? 'var(--status-building)'
-                        : 'var(--accent)',
-                  }}
-                >
-                  <p className="text-xs text-muted-foreground mb-1">
-                    {new Date(event.startTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - {new Date(event.endTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                  </p>
-                  <p className="text-sm font-medium text-foreground">{event.title}</p>
-                  <p className="text-xs text-muted-foreground mt-1 capitalize">{event.type}</p>
-                </div>
-              ))}
+            ) : (
+              // Only show events for the selected day in week view
+              weekDays
+                .filter(day => day.iso === selectedDate)
+                .flatMap(day => day.events)
+                .map((event, index) => (
+                  <div
+                    key={index}
+                    className="p-4 bg-muted/30 rounded-xl border-l-4"
+                    style={{
+                      borderColor:
+                        event.type === 'exam'
+                          ? 'var(--status-high-risk)'
+                          : event.type === 'assignment'
+                          ? 'var(--status-building)'
+                          : 'var(--accent)',
+                    }}
+                  >
+                    <p className="text-xs text-muted-foreground mb-1">
+                      {new Date(event.startTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - {new Date(event.endTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </p>
+                    <p className="text-sm font-medium text-foreground">{event.title}</p>
+                    <p className="text-xs text-muted-foreground mt-1 capitalize">{event.type}</p>
+                  </div>
+                ))
+            )
+          ) : (
+            // Month view: show all events for the selected day
+            selectedDay?.events.map((event, index) => (
+              <div
+                key={index}
+                className="p-4 bg-muted/30 rounded-xl border-l-4"
+                style={{
+                  borderColor:
+                    event.type === 'exam'
+                      ? 'var(--status-high-risk)'
+                      : event.type === 'assignment'
+                      ? 'var(--status-building)'
+                      : 'var(--accent)',
+                }}
+              >
+                <p className="text-xs text-muted-foreground mb-1">
+                  {new Date(event.startTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - {new Date(event.endTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                </p>
+                <p className="text-sm font-medium text-foreground">{event.title}</p>
+                <p className="text-xs text-muted-foreground mt-1 capitalize">{event.type}</p>
+              </div>
+            ))
+          )}
         </div>
 
         <div className="mt-6 pt-6 border-t border-border/50">
