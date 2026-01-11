@@ -14,6 +14,12 @@ const CalendarEventSchema = new Schema(
     startTs: { type: Date, index: true },
     endTs: { type: Date, index: true },
     raw: { type: Schema.Types.Mixed },
+    status: { type: String, enum: ['malleable', 'fixed'], default: 'fixed' },
+    type: {
+      type: String,
+      enum: ['class', 'meeting', 'meal', 'exam', 'assignment', 'nap', 'exercise', 'social', 'event'],
+      default: 'event'
+    },
   },
   { timestamps: true }
 )

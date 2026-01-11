@@ -27,20 +27,20 @@ function Metric({ label, value, trend, icon }: MetricProps) {
 }
 
 interface BurnoutMetricsProps {
-  sleep: string;
-  assignments: string;
-  avgStress: string;
+  sleep?: string | null;
+  assignments?: string | null;
+  avgStress?: string | null;
 }
 
 export function BurnoutMetrics({ sleep, assignments, avgStress }: BurnoutMetricsProps) {
   return (
     <div className="bg-card rounded-2xl p-6 shadow-sm border border-border/50 space-y-3">
       <h3 className="text-lg mb-4 text-foreground">This Week</h3>
-      
+
       <Metric
-        label="Avg Sleep"
-        value={sleep}
-        trend="down"
+        label="Last Sleep"
+        value={sleep || '—'}
+        trend={sleep ? (parseFloat(sleep) < 7 ? 'down' : 'stable') : undefined}
         icon={
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -60,8 +60,8 @@ export function BurnoutMetrics({ sleep, assignments, avgStress }: BurnoutMetrics
       
       <Metric
         label="Assignments Due"
-        value={assignments}
-        trend="up"
+        value={assignments || '—'}
+        trend={assignments && parseInt(assignments) > 0 ? 'up' : undefined}
         icon={
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -79,11 +79,11 @@ export function BurnoutMetrics({ sleep, assignments, avgStress }: BurnoutMetrics
           </svg>
         }
       />
-      
+
       <Metric
-        label="Avg Stress Level"
-        value={avgStress}
-        trend="up"
+        label="Avg Burnout"
+        value={avgStress || '—'}
+        trend={avgStress ? (parseInt(avgStress) > 50 ? 'up' : 'stable') : undefined}
         icon={
           <svg
             xmlns="http://www.w3.org/2000/svg"

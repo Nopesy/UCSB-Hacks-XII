@@ -30,13 +30,13 @@ def get_calendar():
 
 def _try_rest_api_fallback(api_key: str, prompt: str, last_error: Exception = None) -> str:
     """Fallback to REST API when SDK models fail"""
-    # Try models that have available quota
+    # Try models that have available quota (with correct model names)
     rest_models = [
-        'gemini-3-flash',  # 4/5 RPM available
-        'gemini-2.5-flash',  # Available
-        'gemini-2.5-flash-lite',  # Available
-        'gemma-3-12b',  # Available
-        'gemma-3-4b',  # Available
+        'gemini-3-flash-preview',  # Has quota
+        'gemini-2.0-flash-lite',  # Alternative model
+        'gemma-3-12b-it',  # Has quota
+        'gemma-3-4b-it',  # Has quota
+        'gemini-2.5-flash',  # May be at limit
     ]
     
     url_template = 'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}'
@@ -400,6 +400,12 @@ def calculate_nap_time_tool(date_str: str, user_id: str = 'default_user',
    - Consider energy levels throughout the day
    - Factor in commute or preparation time if needed
 
+**CRITICAL CONSTRAINT - NO OVERLAPS**:
+   - You MUST ONLY schedule naps within the free time slots provided above
+   - Do NOT schedule any nap that overlaps with an existing calendar event
+   - The free time slots listed above are the ONLY valid times for nap recommendations
+   - If no suitable free slots exist, explain this in the summary rather than creating conflicting recommendations
+
 **TASK**: Based on the user's schedule above and the available free time slots, provide personalized nap recommendations for {target_date.strftime('%A, %B %d, %Y')}.
 
 **IMPORTANT**: You MUST return ONLY valid JSON in this exact format (no markdown, no code blocks, just pure JSON):
@@ -434,15 +440,16 @@ Return EXACTLY 2 best nap recommendations total (can be mix of power nap and ful
         client = genai.Client()
         
         # List of models to try (prioritize models with available quota)
+        # Note: gemma models need -it suffix for instruction-tuned versions
         models_to_try = [
-            'gemini-3-flash',  # 4/5 RPM available
-            'gemini-2.5-flash',  # Available, 0/5 RPM
-            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
-            'gemma-3-12b',  # Available, 0/30 RPM
-            'gemma-3-4b',  # Available, 0/30 RPM
-            'gemma-3-27b',  # Available, 0/30 RPM
-            'gemma-3-2b',  # Available, 0/30 RPM
-            'gemma-3-1b',  # Available, 0/30 RPM
+            'gemini-3-flash-preview',  # Has quota available
+            'gemini-2.0-flash-lite',  # Alternative flash model
+            'gemma-3-12b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-27b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-4b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-1b-it',  # 0/30 RPM (has quota!)
+            'gemini-2.5-flash',  # May be at quota limit
+            'gemini-2.5-flash-lite',  # May be over quota limit
         ]
         
         last_error = None
@@ -456,7 +463,7 @@ Return EXACTLY 2 best nap recommendations total (can be mix of power nap and ful
                 )
                 gemini_response = response.text
                 break
-                
+
             except Exception as e:
                 error_str = str(e)
                 # If it's a quota error, wait a bit and retry once
@@ -466,7 +473,7 @@ Return EXACTLY 2 best nap recommendations total (can be mix of power nap and ful
                     try:
                         response = client.models.generate_content(
                             model=model,
-                            contents=burnout_prompt,
+                            contents=nap_prompt,
                         )
                         gemini_response = response.text
                         break
@@ -482,11 +489,11 @@ Return EXACTLY 2 best nap recommendations total (can be mix of power nap and ful
                 # If it's not a recoverable error, raise it immediately
                 else:
                     raise
-        
+
         # If all SDK models failed, try REST API as fallback
         if not gemini_response:
             print("All SDK models failed, trying REST API fallback...", flush=True)
-            gemini_response = _try_rest_api_fallback(api_key, burnout_prompt, last_error)
+            gemini_response = _try_rest_api_fallback(api_key, nap_prompt, last_error)
         
         if not gemini_response:
             raise Exception(f"All models exhausted (SDK and REST API). Last error: {last_error}")
@@ -614,8 +621,8 @@ def calculate_meal_windows_tool(date_str: str, user_id: str = 'default_user',
         
         # Filter events for the target date (works for both MongoDB and JSON formats)
         for event in all_events:
-            # Handle both MongoDB format (startISO) and Google Calendar format (start.dateTime)
-            startISO = event.get('startISO')
+            # Handle multiple timestamp formats: startTs (MongoDB), startISO, start.dateTime (Google Calendar)
+            startISO = event.get('startTs') or event.get('startISO')
             if not startISO:
                 start_data = event.get('start', {})
                 if isinstance(start_data, dict):
@@ -635,8 +642,8 @@ def calculate_meal_windows_tool(date_str: str, user_id: str = 'default_user',
                     
                     # Check if event is on target date
                     if event_dt.date() == target_date:
-                        # Parse end time - handle both formats
-                        endISO = event.get('endISO')
+                        # Parse end time - handle multiple formats: endTs (MongoDB), endISO, end.dateTime
+                        endISO = event.get('endTs') or event.get('endISO')
                         if not endISO:
                             end_data = event.get('end', {})
                             if isinstance(end_data, dict):
@@ -759,6 +766,33 @@ def calculate_meal_windows_tool(date_str: str, user_id: str = 'default_user',
    - Consider energy levels throughout the day
    - Avoid scheduling meals during or immediately before/after intense activities
 
+**CRITICAL CONSTRAINTS**:
+
+1. **NO OVERLAPS WITH EVENTS**:
+   - You MUST NOT schedule any meal that overlaps with an existing calendar event
+   - Only suggest meal times that fall completely outside of scheduled events
+   - Check the schedule above carefully and ensure meal start/end times don't conflict with any events
+
+2. **MEAL TIMING PRIORITY** (strongly prefer better times):
+   - **ALWAYS recommend all three meals** (breakfast, lunch, dinner), but prioritize better timing
+   - **Breakfast**: STRONGLY prefer times between wake time and 10:00 AM. If that's not possible, find the earliest available slot before 12:00 PM
+   - **Lunch**: STRONGLY prefer times between 11:30 AM and 2:00 PM. If that's not possible, find the closest available slot (even if earlier or later)
+   - **Dinner**: STRONGLY prefer times between 5:30 PM and 8:00 PM (and at least 3 hours before bedtime). If that's not possible, find an available evening slot
+   - When the ideal window is blocked, choose the free slot that is CLOSEST in time to the ideal window
+   - Give higher priority_score (8-10) to meals in ideal windows, lower scores (4-7) to meals at suboptimal times
+
+3. **NO DUPLICATE MEALS**:
+   - CAREFULLY check the schedule above for any existing meal-related events
+   - Look for keywords like: breakfast, lunch, dinner, meal, snack, brunch, food, eat, dining, cafe, restaurant
+   - Examples of existing meals: "Breakfast with team", "Lunch meeting", "Team dinner", "Coffee and snacks", "Morning meal"
+   - If you see ANY event that indicates a meal is already scheduled, DO NOT recommend that meal type again
+   - For example:
+     * If you see "Breakfast with team" → DO NOT recommend breakfast
+     * If you see "Lunch meeting" → DO NOT recommend lunch
+     * If you see "Dinner at restaurant" → DO NOT recommend dinner
+   - Only recommend meals that are NOT already on the calendar
+   - If all three main meals (breakfast, lunch, dinner) are already scheduled, return an empty recommendations array with a summary like "All meals are already scheduled for this day"
+
 **TASK**: Based on the user's schedule above, wake time ({wake_time_str}), and bedtime ({sleep_time_str}), provide personalized meal window recommendations for {target_date.strftime('%A, %B %d, %Y')}.
 
 **IMPORTANT**: You MUST return ONLY valid JSON in this exact format (no markdown, no code blocks, just pure JSON):
@@ -793,15 +827,16 @@ Return meal recommendations for breakfast, lunch, and dinner (and snacks only if
         client = genai.Client()
         
         # List of models to try (prioritize models with available quota)
+        # Note: gemma models need -it suffix for instruction-tuned versions
         models_to_try = [
-            'gemini-3-flash',  # 4/5 RPM available
-            'gemini-2.5-flash',  # Available, 0/5 RPM
-            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
-            'gemma-3-12b',  # Available, 0/30 RPM
-            'gemma-3-4b',  # Available, 0/30 RPM
-            'gemma-3-27b',  # Available, 0/30 RPM
-            'gemma-3-2b',  # Available, 0/30 RPM
-            'gemma-3-1b',  # Available, 0/30 RPM
+            'gemini-3-flash-preview',  # Has quota available
+            'gemini-2.0-flash-lite',  # Alternative flash model
+            'gemma-3-12b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-27b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-4b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-1b-it',  # 0/30 RPM (has quota!)
+            'gemini-2.5-flash',  # May be at quota limit
+            'gemini-2.5-flash-lite',  # May be over quota limit
         ]
         
         last_error = None
@@ -809,15 +844,18 @@ Return meal recommendations for breakfast, lunch, and dinner (and snacks only if
         
         for model in models_to_try:
             try:
+                print(f"[MEAL] Trying model {model}...", flush=True)
                 response = client.models.generate_content(
                     model=model,
                     contents=meal_prompt,
                 )
                 gemini_response = response.text
+                print(f"[MEAL] Model {model} succeeded!", flush=True)
                 break
-                
+
             except Exception as e:
                 error_str = str(e)
+                print(f"[MEAL] Model {model} error: {type(e).__name__}: {error_str[:300]}", flush=True)
                 # If it's a quota error, wait a bit and retry once
                 if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
                     print(f"Model {model} quota exceeded, waiting 2 seconds and retrying...", flush=True)
@@ -825,7 +863,7 @@ Return meal recommendations for breakfast, lunch, and dinner (and snacks only if
                     try:
                         response = client.models.generate_content(
                             model=model,
-                            contents=burnout_prompt,
+                            contents=meal_prompt,
                         )
                         gemini_response = response.text
                         break
@@ -841,11 +879,11 @@ Return meal recommendations for breakfast, lunch, and dinner (and snacks only if
                 # If it's not a recoverable error, raise it immediately
                 else:
                     raise
-        
+
         # If all SDK models failed, try REST API as fallback
         if not gemini_response:
             print("All SDK models failed, trying REST API fallback...", flush=True)
-            gemini_response = _try_rest_api_fallback(api_key, burnout_prompt, last_error)
+            gemini_response = _try_rest_api_fallback(api_key, meal_prompt, last_error)
         
         if not gemini_response:
             raise Exception(f"All models exhausted (SDK and REST API). Last error: {last_error}")
@@ -1036,19 +1074,52 @@ def predict_burnout_tool(date_str: str, user_id: str = 'default_user',
         # Sort events by start time
         day_events.sort(key=lambda x: x['start'])
         week_events.sort(key=lambda x: (x['date'], x['start']))
-        
+
+        # Calculate schedule metrics for context
+        total_hours = 0
+        num_events = len(day_events)
+        back_to_back_count = 0
+        short_gaps = 0
+        earliest_start = None
+        latest_end = None
+
+        if day_events:
+            earliest_start = day_events[0]['start']
+            latest_end = day_events[-1]['end']
+
+            for i, event in enumerate(day_events):
+                duration = (event['end'] - event['start']).total_seconds() / 3600
+                total_hours += duration
+
+                if i < len(day_events) - 1:
+                    gap = (day_events[i + 1]['start'] - event['end']).total_seconds() / 60
+                    if gap <= 15:
+                        back_to_back_count += 1
+                    elif gap < 30:
+                        short_gaps += 1
+
         # Format schedule for Gemini prompt
         schedule_text = ""
         if day_events:
             schedule_text = f"\n\n📅 SCHEDULE FOR {target_date.strftime('%A, %B %d, %Y')}:\n\n"
-            total_hours = 0
             for event in day_events:
                 start_time = event['start'].strftime('%I:%M %p')
                 end_time = event['end'].strftime('%I:%M %p')
                 duration = (event['end'] - event['start']).total_seconds() / 3600
-                total_hours += duration
                 schedule_text += f"• {start_time} - {end_time}: {event['title']} ({duration:.1f}h)\n"
-            schedule_text += f"\nTotal scheduled time: {total_hours:.1f} hours\n"
+
+            schedule_text += f"\n📊 SCHEDULE METRICS:\n"
+            schedule_text += f"- Total events: {num_events}\n"
+            schedule_text += f"- Total scheduled time: {total_hours:.1f} hours\n"
+            schedule_text += f"- Back-to-back events (≤15 min gap): {back_to_back_count}\n"
+            schedule_text += f"- Short breaks (<30 min gap): {short_gaps}\n"
+            if earliest_start:
+                schedule_text += f"- First event starts: {earliest_start.strftime('%I:%M %p')}\n"
+            if latest_end:
+                schedule_text += f"- Last event ends: {latest_end.strftime('%I:%M %p')}\n"
+            if earliest_start and latest_end:
+                day_span = (latest_end - earliest_start).total_seconds() / 3600
+                schedule_text += f"- Day span: {day_span:.1f} hours\n"
         else:
             schedule_text = f"\n\n📅 SCHEDULE FOR {target_date.strftime('%A, %B %d, %Y')}:\nNo events scheduled for this day.\n"
         
@@ -1089,7 +1160,7 @@ def predict_burnout_tool(date_str: str, user_id: str = 'default_user',
         sleep_duration = (wake_dt - sleep_dt).total_seconds() / 3600
         
         # Build comprehensive prompt for Gemini
-        burnout_prompt = f"""You are a burnout and stress analysis expert using evidence-based research to predict burnout risk.
+        burnout_prompt = f"""You are a burnout and stress analysis expert using evidence-based research.
 
 {schedule_text}
 
@@ -1100,54 +1171,54 @@ def predict_burnout_tool(date_str: str, user_id: str = 'default_user',
 - Wake time: {wake_time_str}
 - Sleep duration: {sleep_duration:.1f} hours
 
-🧠 BURNOUT PREDICTION FACTORS (Based on ATUS 2024 research and stress science):
+🧠 ANALYZE THE SCHEDULE AND DETERMINE BURNOUT RISK:
 
-1. **Schedule Density**:
-   - High event density (back-to-back meetings, no breaks) increases stress
-   - Long work hours (>8 hours) correlate with higher burnout
-   - Fragmented schedules increase tiredness by 63%
+Consider these factors when scoring:
 
-2. **Sleep Quality**:
-   - Optimal sleep: 7-8 hours
-   - People with <6 hours report 65% higher sadness
-   - Sleep duration: {sleep_duration:.1f} hours
+1. **Schedule Density** - How packed is the day?
+   - Back-to-back events with no breaks are exhausting
+   - Long spans (8+ hours) from first to last event increase fatigue
+   - Many events = more cognitive load and transitions
 
-3. **Event Types**:
-   - High-stakes events (exams, presentations, deadlines) increase stress
-   - Social activities can improve mood
-   - Exercise correlates with better well-being
+2. **Event Types** - What kind of activities?
+   - High-stakes (exams, presentations, interviews, deadlines) = HIGH stress
+   - Regular classes/meetings = MODERATE stress
+   - Meals, breaks, naps = RESTORATIVE (reduce stress)
+   - Social activities, exercise, hobbies = can be RESTORATIVE or neutral
 
-4. **Time Management**:
-   - Lack of buffer time between events increases stress
-   - No time for meals or breaks is a red flag
-   - Overcommitment leads to burnout
+3. **Sleep Quality**
+   - <6 hours = significantly increased burnout risk
+   - 6-7 hours = somewhat elevated risk
+   - 7-8 hours = optimal
+   - >8 hours = well-rested
 
-5. **Burnout Score Scale (0-100)**:
-   - 0-30: Low risk (stable, well-balanced schedule)
-   - 31-50: Moderate risk (building stress, some concerns)
-   - 51-70: High risk (stress building, schedule overloaded)
-   - 71-100: Critical risk (high burnout risk, immediate attention needed)
+4. **Time Pressure**
+   - Early starts (before 8 AM) after late nights = exhausting
+   - No time for meals = red flag
+   - Consecutive demanding days = cumulative stress
 
-**TASK**: Analyze the user's schedule for {target_date.strftime('%A, %B %d, %Y')} and predict their burnout risk score.
+📊 SCORING SCALE (0-100):
+- 0-25: Very low risk - light day, plenty of breaks, restorative activities
+- 26-40: Low risk - manageable schedule, some commitments but balanced
+- 41-55: Moderate risk - busy day, limited breaks, building stress
+- 56-70: High risk - packed schedule, back-to-back events, limited recovery
+- 71-85: Very high risk - overwhelming schedule, multiple high-stakes events
+- 86-100: Critical - unsustainable, immediate intervention needed
 
-**IMPORTANT**: You MUST return ONLY valid JSON in this exact format (no markdown, no code blocks, just pure JSON):
+**IMPORTANT**:
+- A day with 5+ back-to-back classes/meetings is NOT "low risk" even if they're just classes
+- Meals and naps scheduled in gaps are GOOD - they reduce the score
+- Look at the ACTUAL event names to determine if they're stressful or restorative
+
+Return ONLY valid JSON (no markdown, no code blocks):
 
 {{
-  "score": 0-100 (integer, burnout risk score),
+  "score": 0-100 (integer),
   "status": "stable" or "building" or "high-risk" or "critical",
-  "reasoning": "Brief explanation of the score and key factors",
-  "key_factors": [
-    "Factor 1 that influenced the score",
-    "Factor 2 that influenced the score",
-    "Factor 3 that influenced the score"
-  ],
-  "recommendations": [
-    "Recommendation 1 to reduce burnout risk",
-    "Recommendation 2 to reduce burnout risk"
-  ]
-}}
-
-Be specific and evidence-based in your analysis. Consider schedule density, sleep duration, event types, and time management."""
+  "reasoning": "Explain your score based on the specific events and schedule density",
+  "key_factors": ["factor1", "factor2", "factor3"],
+  "recommendations": ["recommendation1", "recommendation2"]
+}}"""
         
         # Get API key and set up Gemini client
         api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY')
@@ -1163,15 +1234,16 @@ Be specific and evidence-based in your analysis. Consider schedule density, slee
         client = genai.Client()
         
         # List of models to try (prioritize models with available quota)
+        # Note: gemma models need -it suffix for instruction-tuned versions
         models_to_try = [
-            'gemini-3-flash',  # 4/5 RPM available
-            'gemini-2.5-flash',  # Available, 0/5 RPM
-            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
-            'gemma-3-12b',  # Available, 0/30 RPM
-            'gemma-3-4b',  # Available, 0/30 RPM
-            'gemma-3-27b',  # Available, 0/30 RPM
-            'gemma-3-2b',  # Available, 0/30 RPM
-            'gemma-3-1b',  # Available, 0/30 RPM
+            'gemini-3-flash-preview',  # Has quota available
+            'gemini-2.0-flash-lite',  # Alternative flash model
+            'gemma-3-12b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-27b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-4b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-1b-it',  # 0/30 RPM (has quota!)
+            'gemini-2.5-flash',  # May be at quota limit
+            'gemini-2.5-flash-lite',  # May be over quota limit
         ]
         
         last_error = None
@@ -1233,7 +1305,7 @@ Be specific and evidence-based in your analysis. Consider schedule density, slee
             cleaned_response = cleaned_response.strip()
             
             prediction_data = json.loads(cleaned_response)
-            
+
             # Validate and ensure score is in range
             score = prediction_data.get('score', 50)
             if not isinstance(score, int):
@@ -1241,20 +1313,17 @@ Be specific and evidence-based in your analysis. Consider schedule density, slee
                     score = int(float(score))
                 except (ValueError, TypeError):
                     score = 50
-            score = max(0, min(100, score))  # Clamp to 0-100
-            
-            # Ensure status is valid
-            status = prediction_data.get('status', 'building')
-            if status not in ['stable', 'building', 'high-risk', 'critical']:
-                # Determine status from score
-                if score <= 30:
-                    status = 'stable'
-                elif score <= 50:
-                    status = 'building'
-                elif score <= 70:
-                    status = 'high-risk'
-                else:
-                    status = 'critical'
+            score = max(0, min(100, score))
+
+            # Ensure status matches the score
+            if score <= 30:
+                status = 'stable'
+            elif score <= 50:
+                status = 'building'
+            elif score <= 70:
+                status = 'high-risk'
+            else:
+                status = 'critical'
             
             return json.dumps({
                 "score": score,
@@ -1398,17 +1467,42 @@ def predict_burnout_batch_tool(user_id: str = 'default_user',
         for target_date in date_range:
             day_events = events_by_date[target_date]
             day_events.sort(key=lambda x: x['start'])
-            
+
+            # Calculate metrics for context
+            total_hours = 0
+            num_events = len(day_events)
+            back_to_back_count = 0
+            short_gaps = 0
+            earliest_start = None
+            latest_end = None
+
+            if day_events:
+                earliest_start = day_events[0]['start']
+                latest_end = day_events[-1]['end']
+
+                for i, event in enumerate(day_events):
+                    duration = (event['end'] - event['start']).total_seconds() / 3600
+                    total_hours += duration
+
+                    if i < len(day_events) - 1:
+                        gap = (day_events[i + 1]['start'] - event['end']).total_seconds() / 60
+                        if gap <= 15:
+                            back_to_back_count += 1
+                        elif gap < 30:
+                            short_gaps += 1
+
+            # Format schedule text
             if day_events:
                 schedules_text += f"\n\n📅 {target_date.strftime('%A, %B %d, %Y')}:\n"
-                total_hours = 0
                 for event in day_events:
                     start_time = event['start'].strftime('%I:%M %p')
                     end_time = event['end'].strftime('%I:%M %p')
                     duration = (event['end'] - event['start']).total_seconds() / 3600
-                    total_hours += duration
                     schedules_text += f"  • {start_time} - {end_time}: {event['title']} ({duration:.1f}h)\n"
-                schedules_text += f"  Total scheduled: {total_hours:.1f} hours\n"
+                schedules_text += f"  📊 Metrics: {num_events} events, {total_hours:.1f}h total, {back_to_back_count} back-to-back\n"
+                if earliest_start and latest_end:
+                    day_span = (latest_end - earliest_start).total_seconds() / 3600
+                    schedules_text += f"  📊 Day span: {earliest_start.strftime('%I:%M %p')} - {latest_end.strftime('%I:%M %p')} ({day_span:.1f}h)\n"
             else:
                 schedules_text += f"\n\n📅 {target_date.strftime('%A, %B %d, %Y')}:\n  No events scheduled\n"
         
@@ -1433,7 +1527,7 @@ def predict_burnout_batch_tool(user_id: str = 'default_user',
         sleep_duration = (wake_dt - sleep_dt).total_seconds() / 3600
         
         # Build comprehensive prompt for Gemini
-        burnout_prompt = f"""You are a burnout and stress analysis expert using evidence-based research to predict burnout risk.
+        burnout_prompt = f"""You are a burnout and stress analysis expert using evidence-based research.
 
 {historical_context}
 
@@ -1444,70 +1538,60 @@ def predict_burnout_batch_tool(user_id: str = 'default_user',
 - Wake time: {wake_time_str}
 - Sleep duration: {sleep_duration:.1f} hours
 
-🧠 BURNOUT PREDICTION FACTORS (Based on ATUS 2024 research and stress science):
+🧠 ANALYZE EACH DAY'S SCHEDULE AND DETERMINE BURNOUT RISK:
 
-1. **Schedule Density**:
-   - High event density (back-to-back meetings, no breaks) increases stress
-   - Long work hours (>8 hours) correlate with higher burnout
-   - Fragmented schedules increase tiredness by 63%
+Consider these factors when scoring each day:
 
-2. **Sleep Quality**:
-   - Optimal sleep: 7-8 hours
-   - People with <6 hours report 65% higher sadness
-   - Sleep duration: {sleep_duration:.1f} hours
+1. **Schedule Density** - How packed is the day?
+   - Back-to-back events with no breaks are exhausting
+   - Long spans (8+ hours) from first to last event increase fatigue
+   - Many events = more cognitive load and transitions
 
-3. **Event Types**:
-   - High-stakes events (exams, presentations, deadlines) increase stress
-   - Social activities can improve mood
-   - Exercise correlates with better well-being
+2. **Event Types** - What kind of activities?
+   - High-stakes (exams, presentations, interviews, deadlines) = HIGH stress
+   - Regular classes/meetings = MODERATE stress
+   - Meals, breaks, naps = RESTORATIVE (reduce stress)
+   - Social activities, exercise, hobbies = can be RESTORATIVE or neutral
 
-4. **Time Management**:
-   - Lack of buffer time between events increases stress
-   - No time for meals or breaks is a red flag
-   - Overcommitment leads to burnout
+3. **Sleep Quality**
+   - <6 hours = significantly increased burnout risk
+   - 6-7 hours = somewhat elevated risk
+   - 7-8 hours = optimal
+   - >8 hours = well-rested
 
-5. **CUMULATIVE BURNOUT & RECOVERY EFFECTS** (CRITICAL):
-   - **Recovery Days**: If the user has had 2+ consecutive days with low burnout scores (0-30), they have built up resilience. Even if a day has a packed schedule, the burnout score should be LOWER than it would normally be because recovery days provide a buffer.
-   - **Cumulative Stress**: If the user has had 2+ consecutive days with high burnout scores (50+), they are more vulnerable. A packed schedule on the next day should result in a HIGHER burnout score than normal because stress compounds.
-   - **Recovery Pattern**: After several low-stress days, a moderately busy day should score lower. After several high-stress days, even a moderately busy day should score higher.
-   - **Day-by-Day Progression**: Consider how burnout scores should progress day by day. If Day 1 has score 25 (low), Day 2 has score 28 (low), then Day 3 with a packed schedule might score 35-40 (moderate) instead of 50+ (high) because of the recovery buffer.
-   - **Reset Effect**: If there's a significant gap in historical data or the user had a very low-stress day, consider it a reset point.
+4. **Cumulative Effects**
+   - Consecutive high-stress days compound fatigue
+   - Rest days help recovery
+   - Consider the week's pattern, not just each day in isolation
 
-6. **Burnout Score Scale (0-100)**:
-   - 0-30: Low risk (stable, well-balanced schedule)
-   - 31-50: Moderate risk (building stress, some concerns)
-   - 51-70: High risk (stress building, schedule overloaded)
-   - 71-100: Critical risk (high burnout risk, immediate attention needed)
+📊 SCORING SCALE (0-100):
+- 0-25: Very low risk - light day, plenty of breaks, restorative activities
+- 26-40: Low risk - manageable schedule, some commitments but balanced
+- 41-55: Moderate risk - busy day, limited breaks, building stress
+- 56-70: High risk - packed schedule, back-to-back events, limited recovery
+- 71-85: Very high risk - overwhelming schedule, multiple high-stakes events
+- 86-100: Critical - unsustainable, immediate intervention needed
 
-**TASK**: Analyze the user's schedules for the next {days_ahead} days (from {date_range[0].strftime('%B %d, %Y')} to {date_range[-1].strftime('%B %d, %Y')}) and predict burnout risk scores for EACH day.
+**IMPORTANT**:
+- A day with 5+ back-to-back classes/meetings is NOT "low risk"
+- Meals and naps scheduled in gaps are GOOD - they reduce the score
+- Look at the ACTUAL event names to determine if they're stressful or restorative
+- Empty days or days with only 1-2 events should score LOW (under 30)
 
-**IMPORTANT**: When calculating scores, you MUST consider the cumulative burnout and recovery effects described above. If recent days had low burnout, apply a recovery buffer. If recent days had high burnout, apply cumulative stress effects. Predict scores day-by-day in chronological order, with each day's score influencing the next.
-
-**CRITICAL INSTRUCTIONS FOR CUMULATIVE BURNOUT**:
-1. Calculate predictions SEQUENTIALLY, day by day in chronological order.
-2. For each day, consider:
-   - The schedule density and events for that specific day
-   - The burnout scores of PREVIOUS days (both from historical context and from earlier days in this prediction batch)
-   - Apply recovery buffer if recent days were low-stress
-   - Apply cumulative stress if recent days were high-stress
-3. Example: If Day 1 scores 25 (low), Day 2 scores 28 (low), then Day 3 with a packed schedule should score 35-40 (moderate) instead of 50+ (high) because the user has recovery buffer.
-4. Example: If Day 1 scores 65 (high), Day 2 scores 70 (high), then Day 3 with a moderately busy schedule should score 60-65 (high) instead of 45-50 (moderate) because cumulative stress makes the user more vulnerable.
-
-**IMPORTANT**: You MUST return ONLY valid JSON in this exact format (no markdown, no code blocks, just pure JSON):
+Return ONLY valid JSON (no markdown, no code blocks):
 
 {{
   "predictions": [
     {{
       "date": "YYYY-MM-DD",
-      "score": 0-100 (integer, burnout risk score),
+      "score": 0-100 (integer),
       "status": "stable" or "building" or "high-risk" or "critical",
-      "reasoning": "Brief explanation including how previous days' burnout influenced this score"
-    }},
-    ... (one entry for each day, in chronological order)
+      "reasoning": "Brief explanation based on specific events"
+    }}
   ]
 }}
 
-Return predictions for ALL {days_ahead} days in chronological order. Each day's score should reflect cumulative burnout effects from previous days. Be specific and evidence-based in your analysis."""
+Return predictions for ALL {days_ahead} days in chronological order."""
         
         # Get API key and set up Gemini client
         api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY')
@@ -1523,15 +1607,16 @@ Return predictions for ALL {days_ahead} days in chronological order. Each day's 
         client = genai.Client()
         
         # List of models to try (prioritize models with available quota)
+        # Note: gemma models need -it suffix for instruction-tuned versions
         models_to_try = [
-            'gemini-3-flash',  # 4/5 RPM available
-            'gemini-2.5-flash',  # Available, 0/5 RPM
-            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
-            'gemma-3-12b',  # Available, 0/30 RPM
-            'gemma-3-4b',  # Available, 0/30 RPM
-            'gemma-3-27b',  # Available, 0/30 RPM
-            'gemma-3-2b',  # Available, 0/30 RPM
-            'gemma-3-1b',  # Available, 0/30 RPM
+            'gemini-3-flash-preview',  # Has quota available
+            'gemini-2.0-flash-lite',  # Alternative flash model
+            'gemma-3-12b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-27b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-4b-it',  # 0/30 RPM (has quota!)
+            'gemma-3-1b-it',  # 0/30 RPM (has quota!)
+            'gemini-2.5-flash',  # May be at quota limit
+            'gemini-2.5-flash-lite',  # May be over quota limit
         ]
         
         last_error = None
@@ -1594,34 +1679,32 @@ Return predictions for ALL {days_ahead} days in chronological order. Each day's 
             
             prediction_data = json.loads(cleaned_response)
             predictions = prediction_data.get('predictions', [])
-            
+
             # Validate and process predictions
             validated_predictions = {}
             for pred in predictions:
                 date_str = pred.get('date')
                 if not date_str:
                     continue
-                
+
                 score = pred.get('score', 50)
                 if not isinstance(score, int):
                     try:
                         score = int(float(score))
                     except (ValueError, TypeError):
                         score = 50
-                score = max(0, min(100, score))  # Clamp to 0-100
-                
-                status = pred.get('status', 'building')
-                if status not in ['stable', 'building', 'high-risk', 'critical']:
-                    # Determine status from score
-                    if score <= 30:
-                        status = 'stable'
-                    elif score <= 50:
-                        status = 'building'
-                    elif score <= 70:
-                        status = 'high-risk'
-                    else:
-                        status = 'critical'
-                
+                score = max(0, min(100, score))
+
+                # Ensure status matches the score
+                if score <= 30:
+                    status = 'stable'
+                elif score <= 50:
+                    status = 'building'
+                elif score <= 70:
+                    status = 'high-risk'
+                else:
+                    status = 'critical'
+
                 validated_predictions[date_str] = {
                     'score': score,
                     'status': status,
@@ -1661,14 +1744,14 @@ Return predictions for ALL {days_ahead} days in chronological order. Each day's 
 
 def load_burnout_cache(user_id: str = 'default_user') -> dict:
     """Load cached burnout predictions
-    
+
     Returns:
         Dictionary with cached predictions, or empty dict if cache doesn't exist
     """
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         cache_path = os.path.join(script_dir, 'user_data', f'{user_id}_burnout_cache.json')
-        
+
         if os.path.exists(cache_path):
             with open(cache_path, 'r') as f:
                 cache_data = json.load(f)
@@ -1677,6 +1760,363 @@ def load_burnout_cache(user_id: str = 'default_user') -> dict:
     except Exception as e:
         print(f"Warning: Could not load burnout cache: {e}", flush=True)
         return {}
+
+
+def optimize_schedule_tool(user_id: str = 'default_user',
+                           week_start: str = None,
+                           sleep_time: str = '00:00',
+                           wake_time: str = '08:00',
+                           provided_events: list = None) -> str:
+    """Optimize schedule by suggesting better times for malleable events.
+
+    Uses Gemini AI to analyze the week's schedule and suggest optimal
+    rescheduling for events marked as 'malleable', avoiding conflicts
+    with 'fixed' events.
+
+    Args:
+        user_id: User ID (default: 'default_user')
+        week_start: Start date of week in ISO format 'YYYY-MM-DD'
+        sleep_time: Bedtime in 24-hour format 'HH:MM'
+        wake_time: Wake time in 24-hour format 'HH:MM'
+        provided_events: List of events from MongoDB
+
+    Returns:
+        JSON string with proposed schedule changes
+    """
+    try:
+        # Determine week start date
+        if week_start:
+            start_date = datetime.fromisoformat(week_start).date()
+        else:
+            start_date = datetime.now().date()
+
+        end_date = start_date + timedelta(days=7)
+
+        if not provided_events:
+            return json.dumps({"error": "Events must be provided from MongoDB"})
+
+        # Separate fixed and malleable events
+        fixed_events = []
+        malleable_events = []
+
+        for event in provided_events:
+            # Parse start time
+            startISO = event.get('startISO') or event.get('startTs')
+            if not startISO:
+                continue
+
+            try:
+                if isinstance(startISO, str):
+                    if startISO.endswith('Z'):
+                        startISO = startISO[:-1] + '+00:00'
+                    event_start = datetime.fromisoformat(startISO)
+                    if event_start.tzinfo:
+                        event_start = event_start.astimezone().replace(tzinfo=None)
+                else:
+                    continue
+
+                # Check if within our week range
+                if not (start_date <= event_start.date() < end_date):
+                    continue
+
+                # Parse end time
+                endISO = event.get('endISO') or event.get('endTs')
+                if endISO and isinstance(endISO, str):
+                    if endISO.endswith('Z'):
+                        endISO = endISO[:-1] + '+00:00'
+                    event_end = datetime.fromisoformat(endISO)
+                    if event_end.tzinfo:
+                        event_end = event_end.astimezone().replace(tzinfo=None)
+                else:
+                    event_end = event_start + timedelta(hours=1)
+
+                event_data = {
+                    'id': str(event.get('_id', '')),
+                    'title': event.get('title', 'Event'),
+                    'start': event_start,
+                    'end': event_end,
+                    'type': event.get('type', 'event'),
+                    'status': event.get('status', 'fixed'),
+                    'duration_minutes': int((event_end - event_start).total_seconds() / 60)
+                }
+
+                if event.get('status') == 'malleable':
+                    malleable_events.append(event_data)
+                else:
+                    fixed_events.append(event_data)
+
+            except (ValueError, AttributeError):
+                continue
+
+        if not malleable_events:
+            return json.dumps({
+                "success": True,
+                "proposed_changes": [],
+                "summary": "No malleable events found to optimize"
+            })
+
+        # Sort events by start time
+        fixed_events.sort(key=lambda x: x['start'])
+        malleable_events.sort(key=lambda x: x['start'])
+
+        # Format fixed events for prompt
+        fixed_text = "\n\nFIXED EVENTS (cannot be moved):\n"
+        for ev in fixed_events:
+            fixed_text += f"  {ev['start'].strftime('%a %m/%d %I:%M %p')} - {ev['end'].strftime('%I:%M %p')}: {ev['title']} ({ev['type']})\n"
+
+        if not fixed_events:
+            fixed_text += "  (No fixed events)\n"
+
+        # Format malleable events for prompt
+        malleable_text = "\n\nMALLEABLE EVENTS (can be rescheduled):\n"
+        for ev in malleable_events:
+            malleable_text += f"  ID: {ev['id']}\n"
+            malleable_text += f"  Title: {ev['title']} ({ev['type']})\n"
+            malleable_text += f"  Current: {ev['start'].strftime('%a %m/%d %I:%M %p')} - {ev['end'].strftime('%I:%M %p')}\n"
+            malleable_text += f"  Duration: {ev['duration_minutes']} minutes\n\n"
+
+        # Build optimization prompt - include ISO timestamps for accuracy
+        # Format events with ISO strings for the AI
+        fixed_iso_text = "\n\nFIXED EVENTS (cannot be moved):\n"
+        for ev in fixed_events:
+            fixed_iso_text += f"  {ev['start'].strftime('%a %m/%d %I:%M %p')} - {ev['end'].strftime('%I:%M %p')}: {ev['title']} ({ev['type']})\n"
+            fixed_iso_text += f"    [ISO: {ev['start'].isoformat()} to {ev['end'].isoformat()}]\n"
+
+        if not fixed_events:
+            fixed_iso_text += "  (No fixed events)\n"
+
+        malleable_iso_text = "\n\nMALLEABLE EVENTS (can be rescheduled):\n"
+        for ev in malleable_events:
+            malleable_iso_text += f"  ID: {ev['id']}\n"
+            malleable_iso_text += f"  Title: {ev['title']} ({ev['type']})\n"
+            malleable_iso_text += f"  Current: {ev['start'].strftime('%a %m/%d %I:%M %p')} - {ev['end'].strftime('%I:%M %p')}\n"
+            malleable_iso_text += f"  ISO Start: {ev['start'].isoformat()}\n"
+            malleable_iso_text += f"  ISO End: {ev['end'].isoformat()}\n"
+            malleable_iso_text += f"  Duration: {ev['duration_minutes']} minutes\n\n"
+
+        optimize_prompt = f"""You are a schedule optimization expert helping reduce burnout.
+
+Week: {start_date.strftime('%B %d')} - {end_date.strftime('%B %d, %Y')}
+Sleep: {sleep_time} | Wake: {wake_time}
+{fixed_iso_text}
+{malleable_iso_text}
+
+CRITICAL OPTIMIZATION RULES (MUST FOLLOW ALL):
+1. **SAME DAY ONLY** - The proposed_start date MUST match current_start date EXACTLY!
+   - If current is 2026-01-13, proposed MUST be 2026-01-13 (NOT 2026-01-14 or 2026-01-15!)
+   - NEVER change the YYYY-MM-DD portion, only change the HH:MM:SS
+   - A meal on Wednesday stays on Wednesday, a nap on Monday stays on Monday
+2. **ABSOLUTELY NO CONFLICTS** - Before proposing ANY time, verify it does NOT overlap with fixed events:
+   - For each malleable event, look at the FIXED events on that SAME DAY
+   - Your proposed time CANNOT start during a fixed event
+   - Your proposed time CANNOT end during a fixed event
+   - Example: If pstat 171 is 14:00-15:00, you CANNOT propose 14:00, 14:30, or any time that overlaps
+3. Keep at least 15-minute buffers between events when possible
+4. Avoid scheduling events during sleep hours ({sleep_time} to {wake_time})
+5. Consider event types for optimal timing (but ONLY if the slot is FREE):
+   - Breakfast: 7-9 AM
+   - Lunch: 11 AM - 1 PM (but CHECK for conflicts first!)
+   - Dinner: 5-8 PM
+   - Naps: Early afternoon (1-4 PM) for best rest
+   - Exercise: Morning (6-10 AM) or late afternoon (4-6 PM)
+6. Preserve the original duration of each event
+7. If no conflict-free optimal time exists, use action "keep" instead of "move"
+
+IMPORTANT:
+- Use 24-HOUR TIME FORMAT (e.g., 14:00 for 2 PM, 09:00 for 9 AM)
+- Use the EXACT ISO format from the input for dates
+- The proposed times must use the SAME date as the current_start (same YYYY-MM-DD)
+
+For each malleable event, decide:
+- KEEP: If current time is already good for that event type
+- MOVE: Only if a significantly better time slot exists ON THE SAME DAY
+
+Return ONLY valid JSON (no markdown):
+
+{{
+  "proposed_changes": [
+    {{
+      "event_id": "the event's ID (copy exactly from input)",
+      "event_title": "event title",
+      "action": "keep" or "move",
+      "current_start": "copy the ISO Start from input",
+      "current_end": "copy the ISO End from input",
+      "proposed_start": "YYYY-MM-DDTHH:MM:SS (24-hour format! 2PM = 14:00, same date as current)",
+      "proposed_end": "YYYY-MM-DDTHH:MM:SS (24-hour format! maintain original duration)",
+      "reasoning": "Brief explanation of why this time is better (or why keeping is best)"
+    }}
+  ],
+  "summary": "Brief overall optimization summary"
+}}"""
+
+        # Get API key
+        api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            return json.dumps({"error": "API key not found"})
+
+        if not os.getenv('GOOGLE_API_KEY'):
+            os.environ['GOOGLE_API_KEY'] = api_key
+
+        client = genai.Client()
+
+        # Try models
+        models_to_try = [
+            'gemini-3-flash-preview',
+            'gemini-2.0-flash-lite',
+            'gemma-3-12b-it',
+            'gemini-2.5-flash',
+        ]
+
+        gemini_response = None
+        last_error = None
+
+        for model in models_to_try:
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=optimize_prompt,
+                )
+                gemini_response = response.text
+                break
+            except Exception as e:
+                last_error = e
+                if '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e):
+                    time.sleep(2)
+                continue
+
+        if not gemini_response:
+            gemini_response = _try_rest_api_fallback(api_key, optimize_prompt, last_error)
+
+        if not gemini_response:
+            return json.dumps({"error": f"All models failed: {last_error}"})
+
+        # Parse response
+        cleaned = gemini_response.strip()
+        if cleaned.startswith('```json'):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith('```'):
+            cleaned = cleaned[3:]
+        if cleaned.endswith('```'):
+            cleaned = cleaned[:-3]
+
+        result = json.loads(cleaned.strip())
+
+        # Filter to only include actual moves
+        changes = result.get('proposed_changes', [])
+        moves_only = [c for c in changes if c.get('action') == 'move']
+
+        # Build a lookup map from event ID to ensure we have valid MongoDB IDs
+        id_lookup = {ev['id']: ev for ev in malleable_events}
+        title_lookup = {ev['title'].lower(): ev for ev in malleable_events}
+
+        # Helper function to check if a proposed time conflicts with fixed events
+        def has_conflict(proposed_start_str, proposed_end_str, fixed_events, event_title=""):
+            try:
+                # Parse the proposed times - Gemini returns naive local time strings
+                # DON'T add timezone - treat as naive local time to match fixed_events
+                clean_start = proposed_start_str.replace('Z', '').replace('+00:00', '')
+                clean_end = proposed_end_str.replace('Z', '').replace('+00:00', '')
+
+                # Handle potential timezone suffix
+                if '+' in clean_start:
+                    clean_start = clean_start.split('+')[0]
+                if '+' in clean_end:
+                    clean_end = clean_end.split('+')[0]
+                if '-' in clean_start and clean_start.count('-') > 2:
+                    # Has timezone like -08:00
+                    clean_start = clean_start.rsplit('-', 1)[0]
+                if '-' in clean_end and clean_end.count('-') > 2:
+                    clean_end = clean_end.rsplit('-', 1)[0]
+
+                prop_start = datetime.fromisoformat(clean_start)
+                prop_end = datetime.fromisoformat(clean_end)
+
+                print(f"DEBUG has_conflict: Checking '{event_title}'", flush=True)
+                print(f"  Proposed: {prop_start} to {prop_end}", flush=True)
+            except Exception as e:
+                print(f"DEBUG has_conflict: Parse error for {proposed_start_str}: {e}", flush=True)
+                return True  # Invalid date format, reject
+
+            # Only check fixed events on the SAME DAY as the proposed time
+            prop_date = prop_start.date()
+            same_day_fixed = [f for f in fixed_events if f['start'].date() == prop_date]
+            print(f"  Checking against {len(same_day_fixed)} fixed events on {prop_date}", flush=True)
+
+            for fixed in same_day_fixed:
+                fixed_start = fixed['start']
+                fixed_end = fixed['end']
+                print(f"  vs Fixed '{fixed['title']}': {fixed_start} to {fixed_end}", flush=True)
+                # Check for overlap: two ranges overlap if start1 < end2 AND end1 > start2
+                if prop_start < fixed_end and prop_end > fixed_start:
+                    print(f"  CONFLICT DETECTED!", flush=True)
+                    return True
+            print(f"  No conflict found", flush=True)
+            return False
+
+        # Validate and fix event IDs in the response
+        validated_changes = []
+        for change in moves_only:
+            event_id = change.get('event_id', '')
+            # Try direct ID match first
+            if event_id in id_lookup:
+                matched = True
+            else:
+                # Try matching by title as fallback
+                title = change.get('event_title', '').lower()
+                if title in title_lookup:
+                    change['event_id'] = title_lookup[title]['id']
+                    matched = True
+                else:
+                    matched = False
+
+            if matched:
+                # Double-check for conflicts with fixed events on the same day
+                proposed_start = change.get('proposed_start', '')
+                proposed_end = change.get('proposed_end', '')
+
+                # Parse proposed times (naive local time)
+                try:
+                    clean_start = proposed_start.replace('Z', '').split('+')[0]
+                    clean_end = proposed_end.replace('Z', '').split('+')[0]
+                    current_start_str = change.get('current_start', '').replace('Z', '').split('+')[0]
+
+                    prop_start = datetime.fromisoformat(clean_start)
+                    prop_end = datetime.fromisoformat(clean_end)
+                    current_start = datetime.fromisoformat(current_start_str)
+
+                    prop_date = prop_start.date()
+                    current_date = current_start.date()
+
+                    # RULE 1: Must stay on same day
+                    if prop_date != current_date:
+                        continue
+
+                    # RULE 2: Check for conflicts with fixed events on same day
+                    has_conflict = False
+                    for fixed in fixed_events:
+                        if fixed['start'].date() != prop_date:
+                            continue
+                        # Check overlap
+                        if prop_start < fixed['end'] and prop_end > fixed['start']:
+                            has_conflict = True
+                            break
+
+                    if not has_conflict:
+                        validated_changes.append(change)
+                except Exception:
+                    # Skip if we can't validate
+                    continue
+
+        return json.dumps({
+            "success": True,
+            "proposed_changes": validated_changes,
+            "summary": result.get('summary', f"Found {len(validated_changes)} optimization(s)") if validated_changes else "No optimization suggestions available"
+        }, indent=2)
+
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Failed to parse AI response: {e}"})
+    except Exception as e:
+        return json.dumps({"error": f"Optimization failed: {str(e)}"})
 
 
 # List of tools to pass to Gemini
