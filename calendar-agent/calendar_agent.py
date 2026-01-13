@@ -13,6 +13,14 @@ import requests
 import time
 
 
+# Valid Gemini models to try (in order of preference)
+# Using v1 API models (not v1beta) for better compatibility
+VALID_GEMINI_MODELS = [
+    'gemini-1.5-flash-latest',   # Fast, stable model
+    'gemini-1.5-pro-latest',     # More capable
+    'gemini-pro',                # Legacy stable model
+]
+
 # Initialize calendar lazily (only when needed)
 calendar = None
 
@@ -30,46 +38,45 @@ def get_calendar():
 
 def _try_rest_api_fallback(api_key: str, prompt: str, last_error: Exception = None) -> str:
     """Fallback to REST API when SDK models fail"""
-    # Try models that have available quota
-    rest_models = [
-        'gemini-3-flash',  # 4/5 RPM available
-        'gemini-2.5-flash',  # Available
-        'gemini-2.5-flash-lite',  # Available
-        'gemma-3-12b',  # Available
-        'gemma-3-4b',  # Available
+    # Use the same valid models as SDK, but try v1 API instead of v1beta
+    rest_models = VALID_GEMINI_MODELS
+    
+    # Try both v1 and v1beta endpoints
+    url_templates = [
+        'https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={key}',
+        'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}'
     ]
     
-    url_template = 'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}'
-    
-    for model in rest_models:
-        try:
-            url = url_template.format(model=model, key=api_key)
-            payload = {
-                "contents": [{
-                    "parts": [{"text": prompt}]
-                }]
-            }
-            
-            response = requests.post(url, json=payload, timeout=60)
-            
-            if response.status_code == 200:
-                result = response.json()
-                if 'candidates' in result and len(result['candidates']) > 0:
-                    content = result['candidates'][0].get('content', {})
-                    parts = content.get('parts', [])
-                    if parts and 'text' in parts[0]:
-                        print(f"✅ REST API fallback succeeded with {model}", flush=True)
-                        return parts[0]['text']
-            elif response.status_code == 429:
-                print(f"⚠️  REST API model {model} quota exceeded, trying next...", flush=True)
-                continue
-            else:
-                print(f"⚠️  REST API model {model} failed: {response.status_code}, trying next...", flush=True)
-                continue
+    for url_template in url_templates:
+        for model in rest_models:
+            try:
+                url = url_template.format(model=model, key=api_key)
+                payload = {
+                    "contents": [{
+                        "parts": [{"text": prompt}]
+                    }]
+                }
                 
-        except Exception as e:
-            print(f"⚠️  REST API model {model} error: {str(e)[:100]}, trying next...", flush=True)
-            continue
+                response = requests.post(url, json=payload, timeout=60)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if 'candidates' in result and len(result['candidates']) > 0:
+                        content = result['candidates'][0].get('content', {})
+                        parts = content.get('parts', [])
+                        if parts and 'text' in parts[0]:
+                            print(f"✅ REST API fallback succeeded with {model} ({url_template.split('/')[3]})", flush=True)
+                            return parts[0]['text']
+                elif response.status_code == 429:
+                    print(f"⚠️  REST API model {model} quota exceeded, trying next...", flush=True)
+                    continue
+                else:
+                    print(f"⚠️  REST API model {model} failed: {response.status_code}, trying next...", flush=True)
+                    continue
+                    
+            except Exception as e:
+                print(f"⚠️  REST API model {model} error: {str(e)[:100]}, trying next...", flush=True)
+                continue
     
     return None
 
@@ -434,17 +441,7 @@ Return EXACTLY 2 best nap recommendations total (can be mix of power nap and ful
         client = genai.Client()
         
         # List of models to try (prioritize models with available quota)
-        models_to_try = [
-            'gemini-3-flash',  # 4/5 RPM available
-            'gemini-2.5-flash',  # Available, 0/5 RPM
-            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
-            'gemma-3-12b',  # Available, 0/30 RPM
-            'gemma-3-4b',  # Available, 0/30 RPM
-            'gemma-3-27b',  # Available, 0/30 RPM
-            'gemma-3-2b',  # Available, 0/30 RPM
-            'gemma-3-1b',  # Available, 0/30 RPM
-        ]
-        
+        models_to_try = VALID_GEMINI_MODELS
         last_error = None
         gemini_response = None
         
@@ -793,17 +790,7 @@ Return meal recommendations for breakfast, lunch, and dinner (and snacks only if
         client = genai.Client()
         
         # List of models to try (prioritize models with available quota)
-        models_to_try = [
-            'gemini-3-flash',  # 4/5 RPM available
-            'gemini-2.5-flash',  # Available, 0/5 RPM
-            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
-            'gemma-3-12b',  # Available, 0/30 RPM
-            'gemma-3-4b',  # Available, 0/30 RPM
-            'gemma-3-27b',  # Available, 0/30 RPM
-            'gemma-3-2b',  # Available, 0/30 RPM
-            'gemma-3-1b',  # Available, 0/30 RPM
-        ]
-        
+        models_to_try = VALID_GEMINI_MODELS
         last_error = None
         gemini_response = None
         
@@ -1163,17 +1150,7 @@ Be specific and evidence-based in your analysis. Consider schedule density, slee
         client = genai.Client()
         
         # List of models to try (prioritize models with available quota)
-        models_to_try = [
-            'gemini-3-flash',  # 4/5 RPM available
-            'gemini-2.5-flash',  # Available, 0/5 RPM
-            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
-            'gemma-3-12b',  # Available, 0/30 RPM
-            'gemma-3-4b',  # Available, 0/30 RPM
-            'gemma-3-27b',  # Available, 0/30 RPM
-            'gemma-3-2b',  # Available, 0/30 RPM
-            'gemma-3-1b',  # Available, 0/30 RPM
-        ]
-        
+        models_to_try = VALID_GEMINI_MODELS
         last_error = None
         gemini_response = None
         
@@ -1523,17 +1500,7 @@ Return predictions for ALL {days_ahead} days in chronological order. Each day's 
         client = genai.Client()
         
         # List of models to try (prioritize models with available quota)
-        models_to_try = [
-            'gemini-3-flash',  # 4/5 RPM available
-            'gemini-2.5-flash',  # Available, 0/5 RPM
-            'gemini-2.5-flash-lite',  # Available but may be over RPM limit
-            'gemma-3-12b',  # Available, 0/30 RPM
-            'gemma-3-4b',  # Available, 0/30 RPM
-            'gemma-3-27b',  # Available, 0/30 RPM
-            'gemma-3-2b',  # Available, 0/30 RPM
-            'gemma-3-1b',  # Available, 0/30 RPM
-        ]
-        
+        models_to_try = VALID_GEMINI_MODELS
         last_error = None
         gemini_response = None
         
@@ -1895,14 +1862,8 @@ def run_query(query: str, user_id: str = 'default_user', days_back: int = 10) ->
     # Create client - will automatically use GOOGLE_API_KEY from environment
     client = genai.Client()
 
-    # List of models to try in order (prioritize those with quota available)
-    models_to_try = [
-        'gemini-3-flash',          # 4/5 RPM available
-        'gemini-2.5-flash',        # Available
-        'gemini-2.5-flash-lite',  # Available
-        'gemma-3-12b',            # Available
-        'gemma-3-4b',             # Available
-    ]
+    # Use valid Gemini models
+    models_to_try = VALID_GEMINI_MODELS
 
     last_error = None
 

@@ -91,11 +91,22 @@ export default function App() {
       // Generate dates for the week (last 3 days + today + next 3 days)
       const dates: string[] = [];
       const today = new Date();
+      
+      // Helper to format date as YYYY-MM-DD in local timezone
+      const formatLocalDate = (date: Date): string => {
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+      };
+      
       for (let i = -3; i <= 3; i++) {
         const date = new Date(today);
         date.setDate(date.getDate() + i);
-        dates.push(date.toISOString().split('T')[0]);
+        dates.push(formatLocalDate(date));
       }
+      
+      console.log('[Burnout] Today:', formatLocalDate(today), 'Fetching dates:', dates);
 
       // Fetch events from MongoDB first
       const startDate = dates[0];
@@ -128,11 +139,29 @@ export default function App() {
             });
 
             if (!response.ok) {
-              console.error(`Failed to fetch burnout for ${date}`);
-              return null;
+              const errorText = await response.text();
+              console.error(`Failed to fetch burnout for ${date}:`, response.status, errorText);
+              // Return a default prediction instead of null
+              return {
+                date,
+                score: 50,
+                status: 'building',
+                error: true
+              };
             }
 
             const data = await response.json();
+            if (!data.success && data.error) {
+              console.error(`Burnout API error for ${date}:`, data.error);
+              // Return a default prediction instead of null
+              return {
+                date,
+                score: 50,
+                status: 'building',
+                error: true
+              };
+            }
+            
             return {
               date,
               score: data.score || 50,
@@ -140,14 +169,20 @@ export default function App() {
             };
           } catch (error) {
             console.error(`Error fetching burnout for ${date}:`, error);
-            return null;
+            // Return a default prediction instead of null
+            return {
+              date,
+              score: 50,
+              status: 'building',
+              error: true
+            };
           }
         })
       );
 
       // Transform predictions into weekData format
+      console.log(`[Burnout] Got ${predictions.length} predictions for dates:`, dates);
       const formattedWeekData: WeekDayData[] = predictions
-        .filter((p): p is NonNullable<typeof p> => p !== null)
         .map((prediction, index) => {
           const date = new Date(prediction.date);
           const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
